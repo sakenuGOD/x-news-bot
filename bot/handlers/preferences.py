@@ -243,6 +243,7 @@ async def apply_preference_text(message: Message, text: str) -> None:
         try:
             fetched_new = await _immediate_topic_fetch(
                 user_id, claude_queries_raw, added_accounts,
+                raw_user_text=text,
             )
         except Exception as e:
             log.warning("immediate fetch for user=%s failed: %s", user_id, e)
@@ -278,6 +279,8 @@ async def _immediate_topic_fetch(
     user_id: int,
     queries: list[str],
     added_account_strings: list[str],
+    *,
+    raw_user_text: str = "",
 ) -> int:
     """Сразу после «хочу больше X» — тянем из X посты по запросам и от новых
     каналов, сохраняем с embedding. Возвращаем сколько новых твитов добавили.
@@ -359,9 +362,15 @@ async def _immediate_topic_fetch(
         return 0
 
     # Embedding + topic similarity guard.
-    # Эталон темы = конкатенация Claude-queries (если есть) или «tweet-like» сигнал:
-    # 2-3 слова на запрос, склеенные вместе, дают вектор центра темы.
-    topic_anchor_text = " ".join([q for q in (queries or []) if q]).strip()
+    # Эталон темы = сырой текст юзера + Claude-queries. Сырой текст даёт
+    # более богатый вектор (несколько слов + контекст), чем 3-словные queries
+    # поодиночке. Иначе короткие queries дают слабый anchor и валидный fashion-
+    # контент отсеивается (в логах видел low_sim_drop=37 из 51).
+    anchor_parts: list[str] = []
+    if raw_user_text:
+        anchor_parts.append(raw_user_text)
+    anchor_parts.extend([q for q in (queries or []) if q])
+    topic_anchor_text = " ".join(anchor_parts).strip()
     topic_anchor_emb: Optional[list[float]] = None
     if topic_anchor_text:
         anchor_embs = await emb.embed_batch([topic_anchor_text])
@@ -372,18 +381,23 @@ async def _immediate_topic_fetch(
     embs = await emb.embed_batch(texts)
     pairs_raw = [(rt, e) for rt, e in zip(clean, embs) if e]
 
-    # Similarity-гейт: оставляем посты с cosine >= 0.28 к topic_anchor.
-    # Порог мягкий: 0.3+ — уверенно «по теме», 0.2-0.28 — может быть по смежной,
-    # <0.2 — скорее шум. Если anchor не получился — пропускаем гейт (fail-open).
+    # Similarity-гейт: мягкий порог 0.18 — отсекаем только явный шум, а не
+    # смежные обсуждения. Короткие queries дают слабый anchor, поэтому
+    # высокий порог вырезает валидные посты. Смотрим только на ХВОСТ
+    # распределения (нижние 30% по similarity), всё выше медианы пропускаем.
     pairs: list[tuple] = []
     filtered_low_sim = 0
-    if topic_anchor_emb:
-        for rt, e in pairs_raw:
-            sim = emb.cosine_similarity(e, topic_anchor_emb)
-            if sim >= 0.28:
-                pairs.append((rt, e))
-            else:
+    if topic_anchor_emb and pairs_raw:
+        scored = [(rt, e, emb.cosine_similarity(e, topic_anchor_emb)) for rt, e in pairs_raw]
+        scored.sort(key=lambda x: x[2], reverse=True)
+        # Дропаем только посты с similarity < 0.18 AND в нижней половине.
+        median_sim = scored[len(scored) // 2][2] if scored else 0.0
+        hard_cutoff = 0.18
+        for rt, e, sim in scored:
+            if sim < hard_cutoff and sim < median_sim:
                 filtered_low_sim += 1
+                continue
+            pairs.append((rt, e))
     else:
         pairs = pairs_raw
 

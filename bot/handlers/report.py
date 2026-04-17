@@ -49,54 +49,22 @@ router = Router(name="report")
 
 
 def _format_overview_text(report: Report, digest: bool = False) -> str:
-    """Компактный обзор: сколько чего, список тем.
-
-    digest=True — фронт-страничный режим: рисуем по каждому топ-кластеру с
-    уже сгенерированной выжимкой (summary), как дайджест «что в мире». Ленивой
-    кнопки «нажми на тему чтобы прочитать» больше не нужно — всё содержимое
-    видно в тексте сразу, кнопки ведут к постам для drill-down.
+    """Компактный обзор. И в digest, и в обычном режиме — только заголовок +
+    подсказка. Саммари темы показывается при клике на кнопку (в _render_topic_open),
+    чтобы overview не дублировал summary текстом И кнопками одновременно.
     """
     when = report.generated_at.strftime("%H:%M")
-    header = [
+    lines = [
         f"<b>📊 Дайджест · {when}</b>" if digest else f"<b>📊 Отчёт · {when}</b>",
         f"<i>за последние {report.window_hours:g} ч из твоей ленты</i>",
     ]
-
-    if digest and report.clusters:
-        # Фронт-страница: каждый топ-кластер — заголовок + summary + кол-во постов.
-        blocks: list[str] = []
-        for cl in report.clusters[:7]:  # показываем до 7 тем
-            head = f"\n<b>{cl.emoji} {cl.name}</b> · {len(cl.tweet_ids)}"
-            body = cl.summary.strip() if cl.summary else "<i>(выжимка готовится…)</i>"
-            # Ограничиваем каждый блок — чтобы 4096 не переполнить.
-            if len(body) > 550:
-                body = body[:547].rstrip() + "…"
-            blocks.append(f"{head}\n{body}")
-        footer = "\n\n<i>Кнопки ниже — открыть тему и посмотреть сами посты.</i>"
-        full = "\n".join(header) + "\n" + "\n".join(blocks) + footer
-        # Жёсткий cap на всякий случай.
-        if len(full) > 3900:
-            full = full[:3890].rstrip() + "…"
-        return full
-
-    # Обычный режим: статистика + напоминание про клики.
-    kept_line = f"Осталось по темам: <b>{report.total_in_topics()}</b>"
-    if report.unclustered_ids:
-        kept_line += f" + ещё <b>{len(report.unclustered_ids)}</b> одиночных"
-    lines = list(header) + [
-        "",
-        f"📥 Забрал: <b>{report.fetched}</b>",
-        f"🗑 Шум и дубли: <b>{report.filtered_trash + report.filtered_hype}</b>",
-        f"👀 Уже видел: <b>{report.already_seen}</b>",
-        kept_line,
-    ]
     if not report.clusters:
         lines.append("")
-        lines.append("<i>Тем не набралось — либо лента спокойная, либо всё отфильтровалось. "
-                     "Попробуй через час.</i>")
+        lines.append("<i>Тем не набралось — либо лента спокойная, либо всё "
+                     "отфильтровалось. Попробуй через час.</i>")
     else:
         lines.append("")
-        lines.append("<i>Нажми на тему — покажу дайджест и посты этой темы.</i>")
+        lines.append("<i>Жми на тему — покажу выжимку и посты.</i>")
     return "\n".join(lines)
 
 
