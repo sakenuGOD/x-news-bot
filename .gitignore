@@ -1,0 +1,38 @@
+# secrets
+.env
+x_cookies.json
+
+# database
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# logs
+*.log
+*.log.*
+bot.stdout.log
+bot.stderr.log
+
+# python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# venv
+venv/
+.venv/
+env/
+
+# chroma
+chroma_db/
+
+# ide
+.vscode/
+.idea/
+*.swp
+.DS_Store

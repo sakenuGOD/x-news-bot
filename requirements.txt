@@ -1,0 +1,15 @@
+aiogram>=3.13,<3.16
+anthropic>=0.40,<0.45
+openai>=1.55,<2.0
+# twikit — cookie-based X scraping через внутренний GraphQL (заменил tweety-ns,
+# который в 2026 ломается на anti-bot transactions).
+twikit>=2.3,<3
+# chromadb is optional — ставь отдельно `pip install chromadb` если есть MSVC.
+# Бот работает и без него, ранжирование делается на SQLite-векторах.
+SQLAlchemy>=2.0.30,<2.1
+aiosqlite>=0.19
+APScheduler>=3.10,<4
+aiohttp>=3.10,<3.11
+python-dotenv>=1.0
+pydantic>=2.9,<3
+numpy>=1.26,<3
