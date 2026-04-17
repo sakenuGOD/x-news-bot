@@ -25,7 +25,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable, Optional
 
 import numpy as np
-from sqlalchemy import select
+from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import settings
@@ -140,7 +140,6 @@ async def _derive_interest_queries(
     «fashion trends».
     """
     from db.models import FollowedAuthor
-    from sqlalchemy import select
 
     payload = user.onboarding_payload or {}
     saved = payload.get("saved_search_queries") if isinstance(payload, dict) else None
@@ -366,7 +365,6 @@ async def build_report(
             # (например @voguejapan, @fashionsnap после «японский стиль»).
             # Их посты — самые релевантные для нишевой темы, лучше чем curated.
             from db.models import FollowedAuthor
-            from sqlalchemy import select, desc
             recent_fa_rows = (await session.execute(
                 select(FollowedAuthor.author_username)
                 .where(FollowedAuthor.user_id == user.telegram_id)
