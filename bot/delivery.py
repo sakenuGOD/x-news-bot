@@ -92,8 +92,23 @@ def _caption_body(text: str, limit: int) -> str:
 def format_caption(tweet: Tweet, russian: bool = False) -> str:
     """Красиво оформленная подпись к твиту.
 
-    russian=True → используем tweet.summary_ru (перевод). Если его почему-то нет —
-    падаем в оригинал, чтобы пост всё равно отправился.
+    Layout (фиксированный порядок в одном Telegram-сообщении):
+        [эмодзи темы] <b>Display</b> · <i>@handle</i>
+
+        [текст автора — без quote-хвоста]
+
+        <blockquote>↪ @quoted: текст цитаты</blockquote>  — если есть quote
+
+        <i>🇬🇧 1 ч · ❤️ 678 · 🔁 45 · 💬 20</i>
+
+    Почему blockquote: юзер жаловался «не понятно где реплай, где авторский
+    текст». Telegram рендерит <blockquote> с серой полосой слева и отступом —
+    моментально отделяет цитируемый пост от основного. Раньше quote вставлялся
+    в тело как обычный текст с префиксом «↪ цитирует» и сливался визуально.
+
+    russian=True → используем tweet.summary_ru (перевод). Если его нет — оригинал.
+    Quote блок рендерим из отдельных полей БД (tweet.quote_author/quote_text),
+    чтобы форматирование не зависело от парсинга текста.
     """
     emoji = _TOPIC_EMOJI.get(tweet.topic or "news", "📰")
     display = tweet.author_display_name or tweet.author_username
@@ -106,19 +121,18 @@ def format_caption(tweet: Tweet, russian: bool = False) -> str:
     header = f"{emoji} <b>{display_safe}</b> · <i>@{author_safe}</i>"
 
     body_raw = tweet.summary_ru if (russian and tweet.summary_ru) else tweet.text
-    # Если квота будет послана ОТДЕЛЬНЫМ сообщением (dual-media) — убираем
-    # её блок из caption первого сообщения, чтобы не дублировать текст.
-    if getattr(tweet, "quote_image_url", None) and tweet.image_url and \
-       tweet.quote_image_url != tweet.image_url:
-        # Пробуем оба варианта префикса квоты (новый «↪ цитирует» и старый «▌ »)
-        # — в БД могут лежать ещё старые твиты с прежней разметкой.
-        for marker in ("↪ цитирует ", "▌ @"):
+
+    # Quote уходит ОТДЕЛЬНЫМ сообщением (_send_quote_message) — вырезаем её хвост
+    # из тела caption, чтобы текст цитаты не дублировался. В БД у нас quote-часть
+    # приклеена к tweet.text как «↪ цитирует @user: …» (или «▌ @» для старых).
+    if tweet.quote_author and tweet.quote_text:
+        for marker in ("↪ цитирует ", "Цитирует @", "▌ @"):
             idx = body_raw.find(marker)
             if idx > 0:
                 body_raw = body_raw[:idx].rstrip()
                 break
 
-    # Зарезервируем ~220 символов под шапку/футер.
+    # Резерв на шапку + футер.
     body_limit = max(200, PHOTO_CAPTION_LIMIT - 220)
     body = _caption_body(body_raw, body_limit)
 
@@ -308,32 +322,65 @@ async def _send_media_with_fallback(
         return None
 
 
-async def _send_quote_message(bot: Bot, user_id: int, tweet: Tweet) -> Optional[object]:
-    """Dual-media: если у автора есть своё медиа И квота с отдельным медиа,
-    шлёт второе сообщение с квотой (без кнопок, все действия на первом сообщении).
+async def _send_quote_message(
+    bot: Bot,
+    user_id: int,
+    tweet: Tweet,
+    *,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> Optional[object]:
+    """Второе сообщение — сама цитата (если у поста есть цитата).
 
-    Возвращает отправленный Message или None если квоты не было / отправка упала.
+    Кнопки (like/translate/comments/paginator) теперь живут ЗДЕСЬ, а не на
+    первом сообщении — юзер попросил «чтобы кнопки были у второго поста».
+    Это удобно: второй bubble последний в чате, пагинатор/действия под рукой.
+
+    Режимы:
+      1. Есть quote_image_url — медиа цитаты + caption «↪ цитирует @X: …».
+      2. Нет quote_image_url, но есть quote_text — text-only сообщение.
+      3. Нет quote_author/quote_text — не шлём ничего (обычный пост без цитаты).
     """
-    if not (tweet.quote_image_url and tweet.image_url
-            and tweet.quote_image_url != tweet.image_url):
+    if not (tweet.quote_author and tweet.quote_text):
         return None
-    q_author = html.escape(tweet.quote_author or "")
-    q_body = html.escape((tweet.quote_text or "")[:800])
-    q_caption = f"↪ цитирует <b>@{q_author}</b>\n{q_body}"[:PHOTO_CAPTION_LIMIT]
-    qmt = (tweet.quote_media_type or "photo").lower()
-    if qmt not in ("photo", "video", "animation"):
-        qmt = "photo"
+
+    q_author = html.escape(tweet.quote_author)
+    q_body = html.escape((tweet.quote_text or "").strip())
+
+    has_media = bool(tweet.quote_image_url)
+    text_limit = (PHOTO_CAPTION_LIMIT - 40) if has_media else (TEXT_MESSAGE_LIMIT - 40)
+    if len(q_body) > text_limit:
+        q_body = q_body[: text_limit - 1].rstrip() + "…"
+    caption = f"↪ цитирует <b>@{q_author}</b>\n\n{q_body}"
+
+    if has_media:
+        qmt = (tweet.quote_media_type or "photo").lower()
+        if qmt not in ("photo", "video", "animation"):
+            qmt = "photo"
+        try:
+            sent = await _send_media_with_fallback(
+                bot, user_id,
+                media_url=tweet.quote_image_url,
+                media_type=qmt,
+                caption=caption,
+                reply_markup=reply_markup,
+                tweet_id_hint=f"q_{tweet.tweet_id}",
+            )
+            if sent is not None:
+                return sent
+        except Exception as e:
+            log.debug("dual-bubble quote media send failed for %s: %s", tweet.tweet_id, e)
+
+    # Text-only bubble (или медиа упало).
     try:
-        return await _send_media_with_fallback(
-            bot, user_id,
-            media_url=tweet.quote_image_url,
-            media_type=qmt,
-            caption=q_caption,
-            reply_markup=None,
-            tweet_id_hint=f"q_{tweet.tweet_id}",
+        return await bot.send_message(
+            chat_id=user_id,
+            text=caption,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
         )
-    except Exception as e:
-        log.debug("dual-media quote send failed for %s: %s", tweet.tweet_id, e)
+    except TelegramAPIError as e:
+        log.debug("dual-bubble quote text send failed for %s: %s", tweet.tweet_id, e)
         return None
 
 
@@ -370,26 +417,30 @@ async def _upsert_sent_news(
 
 
 async def cleanup_post_by_message(bot: Bot, user_id: int, message_id: int) -> None:
-    """Удаляет основное сообщение и (если было) quote-сообщение dual-media.
+    """Удаляет основное сообщение и (если было) quote-сообщение dual-bubble.
 
-    Вызывается при листании / back / обновлении — чтобы в чате не оставалось
-    «висящих» кусков (юзер показывал фото с orphan-сообщением — фикс той жалобы).
+    Важно: юзер теперь жмёт кнопки на ВТОРОМ (quote) bubble — значит message_id
+    из callback может принадлежать ЛЮБОМУ из двух. Ищем запись в обоих полях
+    (telegram_message_id ИЛИ quote_telegram_message_id) и гасим обе bubble.
     """
+    main_mid: Optional[int] = message_id
     quote_mid: Optional[int] = None
     try:
         async with session_scope() as s:
             row = (await s.execute(
                 select(SentNews).where(
                     SentNews.user_id == user_id,
-                    SentNews.telegram_message_id == message_id,
+                    (SentNews.telegram_message_id == message_id)
+                    | (SentNews.quote_telegram_message_id == message_id),
                 )
             )).scalar_one_or_none()
             if row:
+                main_mid = row.telegram_message_id
                 quote_mid = row.quote_telegram_message_id
     except Exception as e:
         log.debug("cleanup_post lookup failed: %s", e)
 
-    for mid in (message_id, quote_mid):
+    for mid in (main_mid, quote_mid):
         if not mid:
             continue
         try:
@@ -422,9 +473,17 @@ async def send_one_tweet(
     темы/ленты передают свой пагинатор.
     """
     caption = format_caption(tweet, russian=russian)
-    kb = reply_markup if reply_markup is not None else feedback_kb(
-        tweet.tweet_id, liked=liked, translated=russian,
-    )
+    # Если есть цитата — НЕ шлём её сразу вторым сообщением. Вместо этого
+    # добавляем в клавиатуру кнопку «↪ Цитата: @X» — клик раскроет её
+    # отдельным bubble по запросу. Юзер просил: «не сразу бросаем второй
+    # пост, а делаем инлайн-кнопку типо раскрыть».
+    quote_author = tweet.quote_author if (tweet.quote_author and tweet.quote_text) else None
+    if reply_markup is None:
+        kb = feedback_kb(
+            tweet.tweet_id, liked=liked, translated=russian, quote_author=quote_author,
+        )
+    else:
+        kb = reply_markup  # хендлеры темы передают свой topic_paginator_kb
 
     media_type = _detect_media_type(tweet)
     if tweet.image_url and not media_type:
@@ -443,7 +502,7 @@ async def send_one_tweet(
         )
 
     if msg is None:
-        # Финальный fallback — текст с кнопками (кнопки не теряем!).
+        # Финальный fallback — текст вместо медиа.
         try:
             msg = await bot.send_message(
                 chat_id=user_id,
@@ -456,13 +515,14 @@ async def send_one_tweet(
             log.error("send fallback failed for %s: %s", tweet.tweet_id, e)
             return False
 
-    quote_msg = await _send_quote_message(bot, user_id, tweet)
-
     if record_sent:
+        # Второе сообщение-цитата больше не отправляется автоматом —
+        # quote_message_id всегда None в новой схеме. Поле оставляем
+        # для обратной совместимости cleanup_post_by_message.
         await _upsert_sent_news(
             session, user_id, tweet.tweet_id,
             main_message_id=msg.message_id,
-            quote_message_id=(quote_msg.message_id if quote_msg else None),
+            quote_message_id=None,
         )
 
     return True

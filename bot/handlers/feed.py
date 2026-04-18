@@ -211,14 +211,19 @@ async def handle_feedback(cb: CallbackQuery) -> None:
                 cw[stable_cluster] = max(0.0, cur - 0.08)
                 user.cluster_weights = cw
 
-    # Обновляем кнопки — подсвечиваем выбор, сохраняем текущий язык.
+    # Обновляем кнопки — подсвечиваем выбор, сохраняем текущий язык и
+    # quote-кнопку (если у поста есть цитата, она должна остаться после
+    # like/dislike, иначе юзер её потеряет после первого же клика 👍/👎).
+    quote_author = tweet.quote_author if (tweet.quote_author and tweet.quote_text) else None
     paginator_ctx = _detect_paginator_context(cb)
     if paginator_ctx:
         cid, pos, total = paginator_ctx
         new_kb = topic_paginator_kb(cid, pos, total, tweet_id=tweet_id,
-                                    liked=liked, translated=translated_now)
+                                    liked=liked, translated=translated_now,
+                                    quote_author=quote_author)
     else:
-        new_kb = feedback_kb(tweet_id, liked=liked, translated=translated_now)
+        new_kb = feedback_kb(tweet_id, liked=liked, translated=translated_now,
+                             quote_author=quote_author)
     try:
         await cb.message.edit_reply_markup(reply_markup=new_kb)
     except TelegramAPIError as e:
@@ -258,13 +263,17 @@ async def handle_translate(cb: CallbackQuery) -> None:
         liked = await _current_feedback(s, user_id, tweet_id)
         new_caption = format_caption(tweet, russian=want_russian)
 
+    # При переводе тоже сохраняем quote-кнопку.
+    quote_author = tweet.quote_author if (tweet.quote_author and tweet.quote_text) else None
     paginator_ctx = _detect_paginator_context(cb)
     if paginator_ctx:
         cid, pos, total = paginator_ctx
         new_kb = topic_paginator_kb(cid, pos, total, tweet_id=tweet_id,
-                                    liked=liked, translated=want_russian)
+                                    liked=liked, translated=want_russian,
+                                    quote_author=quote_author)
     else:
-        new_kb = feedback_kb(tweet_id, liked=liked, translated=want_russian)
+        new_kb = feedback_kb(tweet_id, liked=liked, translated=want_russian,
+                             quote_author=quote_author)
 
     # Медиа-сообщения (photo/video/animation/document) редактируются через
     # edit_caption; текстовые — через edit_text. Раньше проверяли только .photo
@@ -308,21 +317,31 @@ async def handle_translate(cb: CallbackQuery) -> None:
 
 
 # Дополнительные сообщения, которые бот отправил как reply на пост-пагинатор
-# (комменты, расшифровки и т.п.). Ключ — user_id, значение — список message_id.
+# (комменты, quote-раскрытия и т.п.). Ключ — user_id, значение — список message_id.
 # При навигации на следующий/предыдущий пост эти сообщения УДАЛЯЮТСЯ вместе с
 # основным, чтобы не оставалось висящих «осиротевших» bubble'ов (юзер показывал
 # фото где после клика на «След» старый «Нет реплаев» остался в чате).
 _EXTRA_BUBBLES: dict[int, list[int]] = {}
+
+# Header-bubble темы (эмодзи + имя + дайджест). Трекается ОТДЕЛЬНО от
+# `_EXTRA_BUBBLES` потому что нам НЕ нужно его удалять при каждом листании
+# ⬅/➡ внутри темы — он даёт контекст «где я нахожусь». Удаляется только при
+# выходе из темы (back / supers / menu) — тогда вызывается cleanup_topic_header.
+_TOPIC_HEADER_BUBBLE: dict[int, int] = {}
 
 
 def _track_bubble(user_id: int, message_id: int) -> None:
     _EXTRA_BUBBLES.setdefault(user_id, []).append(message_id)
 
 
-async def cleanup_bubbles(bot, user_id: int) -> None:
-    """Удаляет все bubble-сообщения, оставшиеся от предыдущего поста.
+def _track_topic_header(user_id: int, message_id: int) -> None:
+    _TOPIC_HEADER_BUBBLE[user_id] = message_id
 
-    Вызывается из пагинаторов ДО показа нового поста.
+
+async def cleanup_bubbles(bot, user_id: int) -> None:
+    """Удаляет extra-bubble'ы (комменты, quote-раскрытия) от предыдущего поста.
+
+    Вызывается из пагинаторов ДО показа нового поста. Header темы НЕ трогает.
     """
     mids = _EXTRA_BUBBLES.pop(user_id, [])
     for mid in mids:
@@ -330,6 +349,71 @@ async def cleanup_bubbles(bot, user_id: int) -> None:
             await bot.delete_message(user_id, mid)
         except TelegramAPIError:
             pass
+    # Сбрасываем «показан ли quote» флаг для этого юзера — при возврате к
+    # посту кнопка «↪ Цитата» снова будет работать, а не считать что уже
+    # отправляли.
+    for k in [k for k in _QUOTE_SHOWN if k[0] == user_id]:
+        _QUOTE_SHOWN.pop(k, None)
+
+
+async def cleanup_topic_header(bot, user_id: int) -> None:
+    """Удаляет header темы. Вызывается при выходе из темы (back / supers / menu)."""
+    mid = _TOPIC_HEADER_BUBBLE.pop(user_id, None)
+    if mid:
+        try:
+            await bot.delete_message(user_id, mid)
+        except TelegramAPIError:
+            pass
+
+
+# ----------------------------- ↪ Раскрыть цитату -----------------------------
+
+
+@router.callback_query(F.data.startswith("qt:"))
+async def handle_show_quote(cb: CallbackQuery) -> None:
+    """Клик по «↪ Цитата: @user» — шлём второе сообщение с текстом/медиа цитаты.
+
+    Это замена автоматического dual-bubble. Раньше бот без спроса отправлял
+    цитату вторым сообщением под каждым постом, и юзер жаловался что не
+    понимает «где пост автора, а где реплай, и когда он закончится». Теперь
+    цитата раскрывается только по явному клику, а её message_id трекается
+    в `_EXTRA_BUBBLES` — при листании ⬅/➡ она уйдёт вместе с основным постом.
+    """
+    try:
+        _, tweet_id = cb.data.split(":", 1)
+    except ValueError:
+        await cb.answer()
+        return
+
+    async with session_scope() as s:
+        tweet = await s.get(Tweet, tweet_id)
+        if not tweet or not (tweet.quote_author and tweet.quote_text):
+            await cb.answer("Цитата недоступна", show_alert=False)
+            return
+
+    await cb.answer()
+
+    # Защита от повторного клика: если юзер уже раскрыл цитату по этому посту
+    # — второй клик не должен продублировать bubble. Простой трекер по
+    # (user_id, tweet_id) внутри процесса.
+    key = (cb.from_user.id, tweet_id)
+    if _QUOTE_SHOWN.get(key):
+        # Уже отправляли — не дублируем.
+        return
+    _QUOTE_SHOWN[key] = True
+
+    from bot.delivery import _send_quote_message
+    msg = await _send_quote_message(cb.bot, cb.from_user.id, tweet, reply_markup=None)
+    if msg is not None:
+        _track_bubble(cb.from_user.id, msg.message_id)
+
+
+# (user_id, tweet_id) → True, чтобы повторный клик «Цитата» не плодил bubble'ы.
+# Чистится автоматически: при листании пост выгружается из чата, а
+# `_QUOTE_SHOWN` очищается по маске tweet_id через cleanup_bubbles(); в худшем
+# случае энтри остаётся в dict, но это O(постов-показанных-в-сессии) — dev-грязь,
+# не memleak.
+_QUOTE_SHOWN: dict[tuple[int, str], bool] = {}
 
 
 @router.callback_query(F.data.startswith("cm:"))

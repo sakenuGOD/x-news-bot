@@ -16,8 +16,9 @@ def feedback_kb(
     tweet_id: str,
     liked: bool | None = None,
     translated: bool = False,
+    quote_author: str | None = None,
 ) -> InlineKeyboardMarkup:
-    """Клавиатура под твитом: 👍 / 👎 / язык.
+    """Клавиатура под твитом: 👍 / 👎 / язык / (↪ Цитата если есть) / 💬 Комменты.
 
     liked=True  → 👍 подсвечен
     liked=False → 👎 подсвечен
@@ -25,6 +26,11 @@ def feedback_kb(
 
     translated=True означает что сейчас показан русский перевод; кнопка предложит
     вернуться к оригиналу.
+
+    quote_author — если задан, добавляется кнопка «↪ Цитата: @<author>». При
+    клике отправляется второе сообщение с текстом/медиа цитаты. Не шлём цитату
+    автоматически как было раньше: юзеру раздражает когда каждый пост
+    превращается в пару bubble'ов «автор / цитата» без его запроса.
     """
     like_txt = "✅ 👍" if liked is True else "👍"
     dis_txt = "✅ 👎" if liked is False else "👎"
@@ -35,18 +41,24 @@ def feedback_kb(
         lang_txt = "🇷🇺 Перевод"
         lang_cb = f"tr:ru:{tweet_id}"
 
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text=like_txt, callback_data=f"fb:like:{tweet_id}"),
-                InlineKeyboardButton(text=dis_txt, callback_data=f"fb:dis:{tweet_id}"),
-                InlineKeyboardButton(text=lang_txt, callback_data=lang_cb),
-            ],
-            [
-                InlineKeyboardButton(text="💬 Комменты", callback_data=f"cm:{tweet_id}"),
-            ],
-        ]
-    )
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(text=like_txt, callback_data=f"fb:like:{tweet_id}"),
+            InlineKeyboardButton(text=dis_txt, callback_data=f"fb:dis:{tweet_id}"),
+            InlineKeyboardButton(text=lang_txt, callback_data=lang_cb),
+        ],
+    ]
+    if quote_author:
+        # Обрезаем до 20 символов — callback_data limit + красиво в UI.
+        qa = quote_author if len(quote_author) <= 20 else quote_author[:19] + "…"
+        rows.append([InlineKeyboardButton(
+            text=f"↪ Цитата: @{qa}",
+            callback_data=f"qt:{tweet_id}",
+        )])
+    rows.append([
+        InlineKeyboardButton(text="💬 Комменты", callback_data=f"cm:{tweet_id}"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def batch_controls_kb() -> InlineKeyboardMarkup:
@@ -218,13 +230,16 @@ def topic_paginator_kb(
     tweet_id: str,
     liked: bool | None = None,
     translated: bool = False,
+    quote_author: str | None = None,
 ) -> InlineKeyboardMarkup:
     """Клавиатура пагинатора темы.
 
     Layout:
-      Row 1:  [👍]  [👎]  [🇷🇺 Перевод / 🇬🇧 Оригинал]    ← реакции на текущий пост
-      Row 2:  [⬅ Пред.]  [N / total]  [След. ➡]           ← навигация
-      Row 3:  [⬅ К темам]  [🏠 В меню]
+      Row 1: [👍] [👎] [🇷🇺 Перевод / 🇬🇧 Оригинал]    ← реакции
+      Row 2: [↪ Цитата: @user]                        ← если есть цитата
+      Row 3: [💬 Комменты]
+      Row 4: [⬅ Пред.] [N/total] [След. ➡]
+      Row 5: [⬅ К темам] [🏠 В меню]
     """
     like_txt = "✅ 👍" if liked is True else "👍"
     dis_txt = "✅ 👎" if liked is False else "👎"
@@ -254,15 +269,20 @@ def topic_paginator_kb(
     else:
         nav_row.append(InlineKeyboardButton(text="·", callback_data="noop"))
 
-    return InlineKeyboardMarkup(inline_keyboard=[
-        fb_row,
-        [InlineKeyboardButton(text="💬 Комменты", callback_data=f"cm:{tweet_id}")],
-        nav_row,
-        [
-            InlineKeyboardButton(text="⬅ К темам", callback_data="rep:back"),
-            InlineKeyboardButton(text="🏠 В меню", callback_data="menu:main"),
-        ],
+    rows: list[list[InlineKeyboardButton]] = [fb_row]
+    if quote_author:
+        qa = quote_author if len(quote_author) <= 20 else quote_author[:19] + "…"
+        rows.append([InlineKeyboardButton(
+            text=f"↪ Цитата: @{qa}",
+            callback_data=f"qt:{tweet_id}",
+        )])
+    rows.append([InlineKeyboardButton(text="💬 Комменты", callback_data=f"cm:{tweet_id}")])
+    rows.append(nav_row)
+    rows.append([
+        InlineKeyboardButton(text="⬅ К темам", callback_data="rep:back"),
+        InlineKeyboardButton(text="🏠 В меню", callback_data="menu:main"),
     ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def interval_kb(with_back: bool = True) -> InlineKeyboardMarkup:

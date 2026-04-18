@@ -4,6 +4,10 @@ openai>=1.55,<2.0
 # twikit — cookie-based X scraping через внутренний GraphQL (заменил tweety-ns,
 # который в 2026 ломается на anti-bot transactions).
 twikit>=2.3,<3
+# x-client-transaction-id генерит правильный X-Client-Transaction-Id header —
+# без него X возвращает 404 на SearchTimeline (selective validation endpoint'а).
+# twikit этот TID не поддерживает (свой алгоритм устарел), поэтому ставим отдельно.
+x-client-transaction-id>=0.0.1
 # chromadb is optional — ставь отдельно `pip install chromadb` если есть MSVC.
 # Бот работает и без него, ранжирование делается на SQLite-векторах.
 SQLAlchemy>=2.0.30,<2.1

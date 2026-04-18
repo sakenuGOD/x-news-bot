@@ -162,13 +162,50 @@ async def _derive_interest_queries(
     if not active and not saved_list:
         return saved_list[:max_queries]
 
-    queries = await ai_client.suggest_interest_queries(
-        cluster_weights=active,
-        saved_queries=saved_list,
-        followed_authors=following_names,
-        max_queries=max_queries,
-    )
-    return queries[:max_queries]
+    # Юзер жаловался: «мода — мусор собрал, Tiffany Blue Book гала вместо стритвира».
+    # Причина: Claude обобщал его реплики («хочу больше про streetwear») в
+    # generic «fashion week» / «haute couture trends» — X-search 404ит на
+    # длинных фразах, authors-fallback тянул @voguemagazine с гала-хрониками.
+    #
+    # Фикс: БЕРЁМ saved_search_queries буквально. Эти фразы уже короткие
+    # (2-3 слова) и конкретные — юзер сам формулировал. Claude добавляет
+    # ОДНУ свежую для разнообразия (не max_queries целиком), а не перегенерирует
+    # всё. saved_queries приоритетнее — это явный сигнал юзера.
+    import random as _random
+    from core import ai_client as _ai
+
+    # Shuffle — чтобы в разных отчётах использовались разные сохранённые фразы
+    # (у юзера их 10+: streetwear, luxury, runway trends, outfit inspo, …).
+    pool = list(saved_list)
+    _random.shuffle(pool)
+    priority = [_ai._shorten_query(q) for q in pool[:max(1, max_queries - 1)]]
+    priority = [q for q in priority if q]  # выкинем пустые после _shorten_query
+
+    # Claude генерит ещё одну СВЕЖУЮ фразу (чтобы лента не была полностью
+    # предсказуемой). Это bonus-query, не замена saved.
+    bonus: list[str] = []
+    try:
+        bonus = await _ai.suggest_interest_queries(
+            cluster_weights=active,
+            saved_queries=saved_list,
+            followed_authors=following_names,
+            max_queries=max(1, max_queries - len(priority)),
+        )
+    except Exception as e:
+        log.debug("bonus interest query failed (ok): %s", e)
+
+    # Дедуп и лимит.
+    out: list[str] = []
+    seen = set()
+    for q in priority + bonus:
+        key = q.lower().strip()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(q)
+        if len(out) >= max_queries:
+            break
+    log.info("interest queries: priority=%s bonus=%s → %s", priority, bonus, out)
+    return out
 
 
 async def _existing_sent_ids(session: AsyncSession, user_id: int) -> set[str]:
@@ -380,7 +417,18 @@ async def build_report(
             recent_authors = [r[0] for r in recent_fa_rows]
 
             already = {t.tweet_id for t in raw}
+            # Early-abort: если 2 первых query дали 0 результатов подряд, X-search
+            # для этой куки скорее всего «мёртв» (404 на всё) — прекращаем
+            # interest-search. Было: 5 запросов × 5 сек × 0 постов = 25 сек впустую
+            # + ещё 40 сек на 429-щие authors-fallback. Итого >60 сек на воздух.
+            consecutive_empty = 0
+            SEARCH_DEAD_THRESHOLD = 2
             for q in interest_queries:
+                if consecutive_empty >= SEARCH_DEAD_THRESHOLD:
+                    log.info("interest-search aborted after %d empty queries in a row "
+                             "(X search 404 likely disabled for this cookie)",
+                             consecutive_empty)
+                    break
                 extra: list[RawTweet] = []
                 try:
                     # Большой count — полноценная подборка темы.
@@ -426,6 +474,12 @@ async def build_report(
                                 extra_ids.add(t.tweet_id)
                     except Exception as e:
                         log.debug("extra author-fetch for %r failed: %s", q, e)
+                # Считаем «пустой» query для early-abort — если ни search, ни
+                # authors-fallback ничего не вернули, это сигнал что X режет эту куку.
+                if not extra:
+                    consecutive_empty += 1
+                else:
+                    consecutive_empty = 0
                 for t in extra:
                     if t.tweet_id not in already:
                         raw.append(t)
@@ -520,6 +574,18 @@ async def build_report(
     await _notify(f"🗂 Группирую в темы…")
     clusters, unclustered_ids = await _cluster_and_name(session, tweets, user, progress=_notify)
 
+    # Adaptive retry: если получилось <5 тем (то что юзер называет «анемичный
+    # отчёт — всего 2 темы»), снижаем min_cluster_size до 2 и пересчитываем.
+    # Пары связанных постов (2 штуки) образуют темы — отчёт становится
+    # пышнее. С cap_per_cluster=8 это безопасно: нельзя получить «тему из 50».
+    MIN_TARGET_TOPICS = 5
+    if len(clusters) < MIN_TARGET_TOPICS and len(tweets) >= 6:
+        await _notify(f"🔬 Тем мало ({len(clusters)}), дроблю мелкие группы…")
+        clusters, unclustered_ids = await _cluster_and_name(
+            session, tweets, user, progress=_notify, min_cluster_size=2,
+        )
+        log.info("adaptive retry with min_cluster_size=2: got %d topics", len(clusters))
+
     # ---------- 6a. Super-topic grouping ----------
     # Claude объединяет 8-10 конкретных тем в 3-5 широких категорий (IT, Мода,
     # Спорт, ...). Overview показывает супер-категории, клик по ним — сами темы.
@@ -601,6 +667,7 @@ async def _cluster_and_name(
     progress: ProgressCb = None,
     max_topics: int = 12,
     min_cluster_size: int = 3,
+    cap_per_cluster: int = 8,
 ) -> tuple[list[ReportCluster], list[str]]:
     """Кластеризация tweets + Claude-именование + merge похожих.
 
@@ -722,17 +789,25 @@ async def _cluster_and_name(
         top_groups.append(rest)
         top_named.append(("📰", "Остальное"))
 
+    # Cap per cluster — в каждой теме оставляем топ-N по _score_for_ordering
+    # (медиа+свежесть+relevance). Юзеру важно видеть 5-8 лучших постов темы,
+    # а не 50 «Claude Design» подряд. Остаток выпадает — в следующий отчёт.
+    # Тест-замер For You показал: 6+ постов в топ-10 про «Claude Design»,
+    # без cap'а один кластер сжирал ~40% ленты и остальные темы выглядели
+    # анемичными (3-4 поста vs 12). Cap уравнивает вес тем для юзера.
     out: list[ReportCluster] = []
     for cid, (grp, (emoji, name)) in enumerate(zip(top_groups, top_named)):
         sorted_idx = sorted(grp, key=lambda i: _score_for_ordering(tweets[i], user_vec), reverse=True)
+        capped = sorted_idx[:cap_per_cluster] if cap_per_cluster > 0 else sorted_idx
         out.append(ReportCluster(
             id=cid,
             emoji=emoji,
             name=name,
-            tweet_ids=[tweets[i].tweet_id for i in sorted_idx],
+            tweet_ids=[tweets[i].tweet_id for i in capped],
         ))
 
-    log.info("clustered %d tweets → %d topics (after name-merge)", len(tweets), len(out))
+    log.info("clustered %d tweets → %d topics (cap=%d/cluster, after name-merge)",
+             len(tweets), len(out), cap_per_cluster)
     return out, unclustered_ids
 
 

@@ -119,6 +119,55 @@ def _cooldown_set(cache: dict, key: str, seconds: float) -> None:
 
 _patches_applied = False
 
+# Реальный X Client Transaction ID генератор. Инициализируется лениво при
+# первом запросе (нужен httpx-клиент для homepage + ondemand.s.js fetch).
+# Пакет `x-client-transaction-id` корректно реверсит алгоритм X — важно,
+# потому что без него X возвращает 404 на SearchTimeline (selective enforcement:
+# HomeTimeline/UserTweets пропускают dummy-TID, Search — нет).
+_REAL_TID_CT = None  # type: ignore[var-annotated]
+_REAL_TID_INIT_LOCK: Optional[asyncio.Lock] = None
+
+
+async def _ensure_real_tid_generator(_unused_client=None):
+    """Создаёт ClientTransaction из x_client_transaction (single-shot).
+
+    Делаем отдельный httpx-клиент (не тот что в twikit), чтобы `set-cookie`
+    от x.com не дублировал `twid`-куку в twikit-сессии (иначе httpx падает
+    с `Multiple cookies exist with name=twid` на последующих запросах).
+    """
+    global _REAL_TID_CT, _REAL_TID_INIT_LOCK
+    if _REAL_TID_CT is not None:
+        return _REAL_TID_CT
+    if _REAL_TID_INIT_LOCK is None:
+        _REAL_TID_INIT_LOCK = asyncio.Lock()
+    async with _REAL_TID_INIT_LOCK:
+        if _REAL_TID_CT is not None:
+            return _REAL_TID_CT
+        try:
+            import bs4
+            import httpx
+            from x_client_transaction import ClientTransaction as _RealCT
+            from x_client_transaction.utils import (
+                handle_x_migration_async, get_ondemand_file_url, generate_headers,
+            )
+            # Отдельный клиент, свои cookies — не мутируем основную twikit-сессию.
+            async with httpx.AsyncClient(
+                follow_redirects=True, timeout=30,
+            ) as tmp:
+                home = await handle_x_migration_async(tmp)
+                ondemand_url = get_ondemand_file_url(home)
+                r = await tmp.get(ondemand_url, headers=generate_headers())
+                if r.status_code != 200:
+                    log.warning("ondemand.s.js fetch %d — real TID disabled", r.status_code)
+                    return None
+                ondemand = bs4.BeautifulSoup(r.text, "html.parser")
+                _REAL_TID_CT = _RealCT(home, ondemand)
+                log.info("real X client-transaction-id generator initialized")
+                return _REAL_TID_CT
+        except Exception as e:
+            log.warning("real TID generator init failed: %s", e)
+            return None
+
 
 def _apply_twikit_patches() -> None:
     global _patches_applied
@@ -145,13 +194,25 @@ def _apply_twikit_patches() -> None:
             self.home_page_response = BeautifulSoup("<html></html>", "html.parser")
 
     def patched_gen(self, method=None, path=None, response=None, key=None, animation_key=None, time_now=None):
-        # twikit зовёт с kwargs — принимаем их тоже.
+        # Приоритет 1 — настоящий X-алгоритм через x_client_transaction (pypi).
+        # Он реверс-инженерит тот же путь что использует x.com в браузере.
+        # Инициализация ленивая и глобальная (_REAL_TID_CT), делается при старте
+        # клиента. Если есть — X принимает TID везде, включая SearchTimeline.
+        if _REAL_TID_CT is not None:
+            try:
+                return _REAL_TID_CT.generate_transaction_id(method=method or "GET", path=path or "/")
+            except Exception as e:
+                log.debug("real TID generate failed, falling back to dummy: %s", e)
+
+        # Приоритет 2 — оригинальный twikit-путь (работает если init прошёл).
         if getattr(self, "_init_ok", True):
             try:
                 return _orig_gen(self, method, path, response, key, animation_key, time_now)
             except Exception as e:
-                log.debug("generate_transaction_id fallthrough to dummy: %s", e)
-        # Фейковый TID той же длины/алфавита — X его не валидирует на read.
+                log.debug("twikit generate_transaction_id fallthrough: %s", e)
+
+        # Приоритет 3 — рандом. Работает только для «мягких» endpoint'ов
+        # (HomeTimeline/UserTweets/TweetDetail). SearchTimeline с рандомом — 404.
         rnd = bytes(random.randint(0, 255) for _ in range(70))
         return base64.b64encode(rnd).decode().rstrip("=")
 
@@ -221,6 +282,208 @@ def _apply_twikit_patches() -> None:
         _TwikitClient._get_user_state = patched_get_user_state
     except Exception as e:
         log.warning("failed to patch _get_user_state: %s", e)
+
+    # --- патч 5: свежий SearchTimeline (queryId + features + variables) ---
+    # X ротирует GraphQL-эндпоинты: меняется и queryId, и набор features, и
+    # иногда variables. twikit 2.3.3 застрял на весенней схеме (21 feature),
+    # а X в апреле-2026 требует 37 features и дополнительное поле
+    # `withGrokTranslatedBio` в variables. Старый endpoint отдаёт 404
+    # целиком (не selectively по features) — так X отсекает устаревших
+    # клиентов, вместо «частичного» ответа без новых полей.
+    #
+    # Снятые значения — из curl-дампа реального запроса из браузера юзера
+    # (DevTools → Network → SearchTimeline → Copy as cURL). Актуальность
+    # сохраняется 1-3 месяца, потом X сдвинет очередной doc_id — тогда
+    # тот же путь: открыть Network, пересмотреть, обновить константы ниже.
+    try:
+        from twikit.client import gql as _twikit_gql
+        _NEW_SEARCH_DOC_ID = "R0u1RWRf748KzyGBXvOYRA"
+        _twikit_gql.Endpoint.SEARCH_TIMELINE = (
+            f"https://x.com/i/api/graphql/{_NEW_SEARCH_DOC_ID}/SearchTimeline"
+        )
+
+        # Полный набор features, которые X ожидает для SearchTimeline весной-2026.
+        _SEARCH_FEATURES = {
+            "rweb_video_screen_enabled": False,
+            "rweb_cashtags_enabled": True,
+            "profile_label_improvements_pcf_label_in_post_enabled": True,
+            "responsive_web_profile_redirect_enabled": False,
+            "rweb_tipjar_consumption_enabled": False,
+            "verified_phone_label_enabled": False,
+            "creator_subscriptions_tweet_preview_api_enabled": True,
+            "responsive_web_graphql_timeline_navigation_enabled": True,
+            "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+            "premium_content_api_read_enabled": False,
+            "communities_web_enable_tweet_community_results_fetch": True,
+            "c9s_tweet_anatomy_moderator_badge_enabled": True,
+            "responsive_web_grok_analyze_button_fetch_trends_enabled": False,
+            "responsive_web_grok_analyze_post_followups_enabled": True,
+            "responsive_web_jetfuel_frame": True,
+            "responsive_web_grok_share_attachment_enabled": True,
+            "responsive_web_grok_annotations_enabled": True,
+            "articles_preview_enabled": True,
+            "responsive_web_edit_tweet_api_enabled": True,
+            "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
+            "view_counts_everywhere_api_enabled": True,
+            "longform_notetweets_consumption_enabled": True,
+            "responsive_web_twitter_article_tweet_consumption_enabled": True,
+            "content_disclosure_indicator_enabled": True,
+            "content_disclosure_ai_generated_indicator_enabled": True,
+            "responsive_web_grok_show_grok_translated_post": True,
+            "responsive_web_grok_analysis_button_from_backend": True,
+            "post_ctas_fetch_enabled": True,
+            "freedom_of_speech_not_reach_fetch_enabled": True,
+            "standardized_nudges_misinfo": True,
+            "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
+            "longform_notetweets_rich_text_read_enabled": True,
+            "longform_notetweets_inline_media_enabled": False,
+            "responsive_web_grok_image_annotation_enabled": True,
+            "responsive_web_grok_imagine_annotation_enabled": True,
+            "responsive_web_grok_community_note_auto_translation_is_enabled": True,
+            "responsive_web_enhance_cards_enabled": False,
+        }
+
+        # Заменяем метод search_timeline целиком — он строит variables+features
+        # и зовёт gql_get. Мы передаём свои свежие features.
+        async def patched_search_timeline(self, query, product, count, cursor):
+            variables = {
+                "rawQuery": query,
+                "count": count,
+                "querySource": "typed_query",
+                "product": product,
+                "withGrokTranslatedBio": True,  # новое поле для свежего endpoint
+            }
+            if cursor is not None:
+                variables["cursor"] = cursor
+            return await self.gql_get(
+                _twikit_gql.Endpoint.SEARCH_TIMELINE,
+                variables,
+                _SEARCH_FEATURES,
+            )
+
+        _twikit_gql.GQLClient.search_timeline = patched_search_timeline
+        log.debug("twikit patch 5 applied: fresh SearchTimeline (queryId + features + variables)")
+    except Exception as e:
+        log.warning("failed to patch SearchTimeline: %s", e)
+
+    # --- патч 4: get_tweet_by_id — cursor schema drift ---
+    # twikit 2.3.3 в client.py:1635 ожидает `entries[-1].content.itemContent.value`
+    # для cursor'а, но X весной-2026 сменил формат на `entries[-1].content.value`
+    # (TimelineTimelineCursor напрямую, без itemContent-обёртки). Падает KeyError,
+    # весь get_tweet_by_id ломается → get_top_replies возвращает пусто.
+    # Патчим: копируем тело оригинала, cursor достаём через defensive helper.
+    try:
+        from twikit.client.client import Client as _TwikitClient
+        from twikit.utils import find_dict, Result as _TwikitResult
+        from twikit.tweet import tweet_from_data
+        from functools import partial as _partial
+        from twikit.errors import TweetNotAvailable
+
+        def _extract_cursor_value(entry):
+            """`content.itemContent.value` ИЛИ `content.value` — обе схемы видел."""
+            if not isinstance(entry, dict):
+                return None
+            content = entry.get("content") or {}
+            item = content.get("itemContent")
+            if isinstance(item, dict) and "value" in item:
+                return item["value"]
+            if "value" in content:
+                return content["value"]
+            return None
+
+        async def patched_get_tweet_by_id(self, tweet_id, cursor=None):
+            response, _ = await self.gql.tweet_detail(tweet_id, cursor)
+            if "errors" in response:
+                raise TweetNotAvailable(response["errors"][0]["message"])
+
+            entries_found = find_dict(response, "entries", find_one=True)
+            if not entries_found:
+                raise TweetNotAvailable(f"no entries in TweetDetail for {tweet_id}")
+            entries = entries_found[0]
+            reply_to, replies_list, related_tweets = [], [], []
+            tweet = None
+
+            for entry in entries:
+                eid = entry.get("entryId", "")
+                if eid.startswith("cursor"):
+                    continue
+                try:
+                    tweet_object = tweet_from_data(self, entry)
+                except Exception as e:
+                    log.debug("tweet_from_data failed for entry %s: %s", eid, e)
+                    continue
+                if tweet_object is None:
+                    continue
+
+                if eid.startswith("tweetdetailrelatedtweets"):
+                    related_tweets.append(tweet_object)
+                    continue
+
+                if eid == f"tweet-{tweet_id}":
+                    tweet = tweet_object
+                    continue
+
+                if tweet is None:
+                    reply_to.append(tweet_object)
+                    continue
+
+                # Reply conversation — thread с главным твитом наверху и реплаями ниже.
+                items = ((entry.get("content") or {}).get("items") or [])[1:]
+                sub_replies = []
+                sr_cursor = None
+                show_replies = None
+                for reply in items:
+                    r_eid = reply.get("entryId", "")
+                    if "tweetcomposer" in r_eid:
+                        continue
+                    if "tweet" in r_eid:
+                        try:
+                            rpl = tweet_from_data(self, reply)
+                        except Exception:
+                            rpl = None
+                        if rpl is not None:
+                            sub_replies.append(rpl)
+                    if "cursor" in r_eid:
+                        item = reply.get("item") or {}
+                        ic = item.get("itemContent") or {}
+                        sr_cursor = ic.get("value") or item.get("value")
+                        if sr_cursor:
+                            show_replies = _partial(
+                                self._show_more_replies, tweet_id, sr_cursor,
+                            )
+                try:
+                    tweet_object.replies = _TwikitResult(sub_replies, show_replies, sr_cursor)
+                except Exception:
+                    tweet_object.replies = sub_replies
+                replies_list.append(tweet_object)
+
+            # Defensive cursor extraction — было KeyError('itemContent') на этом месте.
+            reply_next_cursor = None
+            _fetch_more_replies = None
+            if entries and entries[-1].get("entryId", "").startswith("cursor"):
+                reply_next_cursor = _extract_cursor_value(entries[-1])
+                if reply_next_cursor:
+                    _fetch_more_replies = _partial(
+                        self._get_more_replies, tweet_id, reply_next_cursor,
+                    )
+
+            if tweet is None:
+                raise TweetNotAvailable(f"main tweet {tweet_id} not in entries")
+
+            try:
+                tweet.replies = _TwikitResult(
+                    replies_list, _fetch_more_replies, reply_next_cursor,
+                )
+            except Exception:
+                tweet.replies = replies_list
+            tweet.reply_to = reply_to
+            tweet.related_tweets = related_tweets
+            return tweet
+
+        _TwikitClient.get_tweet_by_id = patched_get_tweet_by_id
+        log.debug("twikit patch 4 applied: defensive get_tweet_by_id cursor")
+    except Exception as e:
+        log.warning("failed to patch get_tweet_by_id: %s", e)
 
     _patches_applied = True
     log.info("twikit runtime patches applied (anti-bot bypass + defensive User parsing + no-recurse on 429)")
@@ -310,6 +573,12 @@ class XParser:
                     self._client = client
                     self._auth_ok = True
                     log.info("X auth: cookies loaded from %s", cookies_path)
+                    # Инициализируем настоящий X-client-transaction-id генератор.
+                    # Без него SearchTimeline возвращает 404 (selective validation).
+                    try:
+                        await _ensure_real_tid_generator(client.http)
+                    except Exception as e:
+                        log.warning("real TID init failed (search may 404): %s", e)
                     return client
                 except Exception as e:
                     log.warning("X cookies file malformed (%s): %s", cookies_path, e)
@@ -977,6 +1246,13 @@ def _convert_tweet(t, fallback_author: str) -> RawTweet:
         or getattr(author_obj, "username", None)
         or fallback_author
     )
+    # Защита от «нейрослопа»: SearchTimeline иногда отдаёт твиты где user
+    # не получилось распарсить — в этом случае `fallback_author` остаётся
+    # равным 'unknown' (дефолт вызывающих). Такие посты обычно AI-сгенерированный
+    # мусор низкого качества (fashion-слоп, crypto-spam, generic templates),
+    # и пользователю они только портят ленту. Откидываем.
+    if not author_username or author_username.lower() == "unknown":
+        raise ValueError(f"no author for tweet {tweet_id}")
     display = getattr(author_obj, "name", None) or author_username
 
     text = getattr(t, "full_text", None) or getattr(t, "text", "") or ""
