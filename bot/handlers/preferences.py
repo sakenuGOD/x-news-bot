@@ -171,7 +171,11 @@ async def apply_preference_text(message: Message, text: str) -> None:
             for q in claude_queries_raw:
                 if isinstance(q, str) and q.strip() and q not in saved:
                     saved.append(q.strip())
-            saved = saved[-10:]
+            # Было 10 — старые запросы протекали в interest-search. Юзер
+            # пишет «про одежду», а в ленте «graphic design» с 2 недель назад.
+            # 5 последних = текущий интерес юзера + немного фона для
+            # диверсификации, без конфликтующих призраков.
+            saved = saved[-5:]
             payload["saved_search_queries"] = saved
             user.onboarding_payload = payload
 
@@ -191,6 +195,7 @@ async def apply_preference_text(message: Message, text: str) -> None:
     suggested = list(getattr(result, "suggested_accounts", []) or [])
 
     async with session_scope() as s:
+        from sqlalchemy import update as _sa_update, func as _sa_func
         rows = (await s.execute(
             select(FollowedAuthor.author_username).where(FollowedAuthor.user_id == user_id)
         )).all()
@@ -199,8 +204,18 @@ async def apply_preference_text(message: Message, text: str) -> None:
         log.info("auto-add: user=%s claude-suggested=%s already_count=%d",
                  user_id, suggested, len(already))
 
+        # Список handle которые Claude предложил повторно (уже были): обновляем
+        # added_at=NOW чтобы pinned cluster «Свежее от добавленных» сработал.
+        # Без этого: юзер третий раз пишет «больше моды», бот находит те же
+        # @Highsnobiety/@GQ, пропускает (уже есть), added_at остался с прошлой
+        # недели → fresh_cutoff 6h не видит → pin не создаётся.
+        refreshed_handles: list[str] = []
+
         for handle in suggested[:8]:
-            if not handle or handle.lower() in already:
+            if not handle:
+                continue
+            if handle.lower() in already:
+                refreshed_handles.append(handle)
                 continue
             # Проверяем что аккаунт реально есть в X.
             info = None
@@ -228,10 +243,24 @@ async def apply_preference_text(message: Message, text: str) -> None:
             s.add(FollowedAuthor(user_id=user_id, author_username=info.username, weight=2.0))
             already.add(info.username.lower())
             added_accounts.append(f"@{info.username}")
+            refreshed_handles.append(info.username)
             log.info("auto-add: user=%s +@%s (followers=%d verified=%s)",
                      user_id, info.username, info.followers_count, info.verified)
             if len(added_accounts) >= 6:
                 break
+
+        # Refresh added_at для уже существующих handle — иначе при повторном
+        # «хочу больше моды» pinned cluster «Свежее от добавленных» не
+        # срабатывает (added_at старый → за пределами 6h fresh_cutoff).
+        if refreshed_handles:
+            lowered = [h.lower() for h in refreshed_handles]
+            await s.execute(
+                _sa_update(FollowedAuthor)
+                .where(FollowedAuthor.user_id == user_id)
+                .where(_sa_func.lower(FollowedAuthor.author_username).in_(lowered))
+                .values(added_at=_sa_func.now())
+            )
+            log.info("auto-add: refreshed added_at for %d handles", len(refreshed_handles))
 
     # IMMEDIATE FETCH — ключевое отличие от «просто +1 поста». Юзер сказал
     # «больше моды» → сразу идём в X: (1) search по claude-queries, (2) последние
@@ -305,17 +334,21 @@ async def _immediate_topic_fetch(
     all_raw = []
     seen_ids: set[str] = set()
 
-    # 1) X-search по каждому Claude-запросу (top + latest).
+    # 1) X-search по каждому Claude-запросу (top + latest). Большой захват:
+    # юзер прямо попросил «больше X» — даём ему реально много свежего контента.
+    # Раньше было 40+30=70 на запрос, всего ~350. Теперь до 80 на запрос — это
+    # ~600+ постов кандидатов на 5 запросов после дедупа. После similarity-гейта
+    # и трэш-фильтра в DB упадёт 60-100 валидных постов темы.
     for q in (queries or [])[:5]:
         if not q or not q.strip():
             continue
         try:
-            top = await parser.search_tweets(q, product="Top", count=40)
+            top = await parser.search_tweets(q, product="Top", count=80)
             for t in top:
                 if t.tweet_id not in seen_ids:
                     all_raw.append(t)
                     seen_ids.add(t.tweet_id)
-            latest = await parser.search_tweets(q, product="Latest", count=30)
+            latest = await parser.search_tweets(q, product="Latest", count=80)
             for t in latest:
                 if t.tweet_id not in seen_ids:
                     all_raw.append(t)
@@ -323,23 +356,24 @@ async def _immediate_topic_fetch(
         except Exception as e:
             log.debug("immediate search(%s): %s", q, e)
 
-    # 2) Последние посты от добавленных каналов + curated-fallback если search пуст.
+    # 2) Последние посты от добавленных каналов + recent FollowedAuthor.
     handles = [a.lstrip("@") for a in (added_account_strings or []) if a]
-    # Также добавим топ-5 недавно добавленных FollowedAuthor этого юзера.
     async with session_scope() as s:
         rows = (await s.execute(
             _select(FollowedAuthor.author_username)
             .where(FollowedAuthor.user_id == user_id)
             .order_by(_desc(FollowedAuthor.added_at))
-            .limit(8)
+            .limit(12)
         )).all()
         recent_fa = [r[0] for r in rows if r[0] and r[0] not in handles]
     fetch_handles = handles + recent_fa
 
     if fetch_handles:
         try:
+            # 12 авторов × 12 постов = до 144 кандидатов от подобранных каналов.
+            # Раньше: 8×8=64. Юзер видит больше каналов и больше их недавних постов.
             author_tweets = await parser.get_recent_tweets_for_authors(
-                fetch_handles[:8], limit_per_author=8,
+                fetch_handles[:12], limit_per_author=12,
             )
             for t in author_tweets:
                 if t.tweet_id not in seen_ids:
@@ -381,20 +415,19 @@ async def _immediate_topic_fetch(
     embs = await emb.embed_batch(texts)
     pairs_raw = [(rt, e) for rt, e in zip(clean, embs) if e]
 
-    # Similarity-гейт: мягкий порог 0.18 — отсекаем только явный шум, а не
-    # смежные обсуждения. Короткие queries дают слабый anchor, поэтому
-    # высокий порог вырезает валидные посты. Смотрим только на ХВОСТ
-    # распределения (нижние 30% по similarity), всё выше медианы пропускаем.
+    # Similarity-гейт. Было 0.18 — пропускал «hairy guy video», quote-tweet с
+    # NSFW, и spam-посты про одежду от farm-аккаунтов. Поднимаем порог до 0.25
+    # — это всё ещё пропускает ассоциированный контент (streetwear → fashion
+    # news), но режет явные off-topic с единственным совпадающим словом
+    # («clothes» в NSFW-цитате).
     pairs: list[tuple] = []
     filtered_low_sim = 0
     if topic_anchor_emb and pairs_raw:
         scored = [(rt, e, emb.cosine_similarity(e, topic_anchor_emb)) for rt, e in pairs_raw]
         scored.sort(key=lambda x: x[2], reverse=True)
-        # Дропаем только посты с similarity < 0.18 AND в нижней половине.
-        median_sim = scored[len(scored) // 2][2] if scored else 0.0
-        hard_cutoff = 0.18
+        hard_cutoff = 0.25
         for rt, e, sim in scored:
-            if sim < hard_cutoff and sim < median_sim:
+            if sim < hard_cutoff:
                 filtered_low_sim += 1
                 continue
             pairs.append((rt, e))
@@ -409,9 +442,32 @@ async def _immediate_topic_fetch(
     async with session_scope() as s:
         before = len(pairs)
         await _upsert_raw_tweets(s, pairs)
+
+        # Сохраняем upserted tweet_ids в user.onboarding_payload — build_report
+        # их достанет и добавит в кластеризацию. Без этого 55 immediate-fetch
+        # постов в БД есть, но build_report их не видит (он делает свежий
+        # get_home_timeline и не заглядывает в pending Tweet'ы).
+        pending_ids = [rt.tweet_id for rt, _ in pairs]
+        if pending_ids:
+            from db.models import User as _U
+            user_row = await s.get(_U, user_id)
+            if user_row:
+                payload = dict(user_row.onboarding_payload or {})
+                existing_pending = list(payload.get("pending_boost_ids") or [])
+                # Дедуп + окно: храним не больше 200 id (защита от распухания).
+                merged: list[str] = []
+                seen_p: set[str] = set()
+                for tid in pending_ids + existing_pending:
+                    if tid and tid not in seen_p:
+                        seen_p.add(tid)
+                        merged.append(tid)
+                payload["pending_boost_ids"] = merged[:200]
+                user_row.onboarding_payload = payload
+
         log.info(
             "immediate fetch user=%s: upserted %d tweets "
-            "(queries=%d handles=%d low_sim_drop=%d)",
+            "(queries=%d handles=%d low_sim_drop=%d, pending=%d)",
             user_id, before, len(queries or []), len(fetch_handles), filtered_low_sim,
+            len(pending_ids),
         )
         return before

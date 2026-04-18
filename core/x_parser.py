@@ -222,9 +222,36 @@ def _apply_twikit_patches() -> None:
     # --- User.__init__ defensive ---
     _orig_user_init = _twikit_user_module.User.__init__
 
+    def _coalesce_screen_name(data: dict, legacy: dict) -> str:
+        """В X-2026 для SearchTimeline screen_name живёт в `core.screen_name`,
+        а в `legacy.screen_name` пусто (до 2025 было наоборот). UserTweets/
+        HomeTimeline до сих пор кладут в legacy. Берём первое непустое.
+        Без этого 100% search-results дропаются в _convert_tweet с
+        `ValueError: no author for tweet ...` — каждый «больше моды/футбола»
+        отдаёт 0 постов и падает в curated-fallback (там 429 loop)."""
+        core = data.get("core") or {}
+        return (core.get("screen_name") or legacy.get("screen_name") or "").strip()
+
+    def _coalesce_name(data: dict, legacy: dict) -> str:
+        core = data.get("core") or {}
+        return core.get("name") or legacy.get("name", "")
+
     def patched_user_init(self, client, data):
         try:
             _orig_user_init(self, client, data)
+            # Постфикс для SEARCH-результатов: оригинальный init читает
+            # legacy.screen_name, у search-веток этого поля нет → screen_name=''
+            # → весь tweet дропается. Если пусто — добираем из core.
+            if not getattr(self, "screen_name", ""):
+                legacy_p = data.get("legacy") or {}
+                sn = _coalesce_screen_name(data, legacy_p)
+                if sn:
+                    self.screen_name = sn
+            if not getattr(self, "name", ""):
+                legacy_p = data.get("legacy") or {}
+                nm = _coalesce_name(data, legacy_p)
+                if nm:
+                    self.name = nm
             return
         except (KeyError, TypeError) as e:
             log.debug("User.__init__ schema drift, falling back to defensive: %s", e)
@@ -234,8 +261,8 @@ def _apply_twikit_patches() -> None:
         ent = legacy.get("entities") or {}
         self.id = data.get("rest_id") or legacy.get("id_str", "")
         self.created_at = legacy.get("created_at", "")
-        self.name = legacy.get("name", "")
-        self.screen_name = legacy.get("screen_name", "")
+        self.name = _coalesce_name(data, legacy)
+        self.screen_name = _coalesce_screen_name(data, legacy)
         self.profile_image_url = legacy.get("profile_image_url_https", "")
         self.profile_banner_url = legacy.get("profile_banner_url")
         self.url = legacy.get("url")
@@ -514,6 +541,11 @@ class RawTweet:
     # Кто квотируется — чтобы caption второго сообщения был «↪ @<handle>: ...».
     quote_author: Optional[str] = None
     quote_text: Optional[str] = None
+    # Если в тексте есть t.co ссылка на ДРУГОЙ статус-твит (RT/embed без
+    # native quote) — сохраняем target tweet_id. Delivery позже использует
+    # его чтобы подтянуть медиа (типичный кейс «by @kianbazza t.co/X» где
+    # видео физически у @kianbazza, а текущий пост без медиа).
+    linked_tweet_id: Optional[str] = None
 
     @property
     def age_hours(self) -> float:
@@ -770,12 +802,18 @@ class XParser:
 
         То что пользователь видит у себя в X на вкладке «Following» —
         без алгоритма, просто новое сверху.
+
+        Пагинация: X за один запрос отдаёт ~40-80 постов. Чтобы добрать
+        до `limit`, идём через .next(). Юзер жаловался «он не собирает мою
+        фоловинг ленту, как было» — раньше один запрос давал топ 100, сейчас
+        с большим числом подписок видно тонкий срез. 2-3 страницы = 200-250
+        постов = настоящая 24-часовая лента подписок.
         """
         client = await self._ensure_client()
         try:
             async with _X_API_SEM:
-                tl = await asyncio.wait_for(
-                    client.get_latest_timeline(count=min(100, max(20, limit))),
+                page = await asyncio.wait_for(
+                    client.get_latest_timeline(count=40),
                     timeout=25,
                 )
         except RecursionError:
@@ -788,7 +826,28 @@ class XParser:
             log.warning("get_latest_timeline: %s", str(e)[:200])
             return []
 
-        return self._convert_timeline(tl, limit)
+        all_tweets = list(page)
+        # Пагинация — набираем до limit. 3 шага обычно хватает: 40+40+40=120.
+        # При limit=400 — до 5 страниц. 429 на странице → прерываемся, то что
+        # уже набрали отдадим.
+        for _ in range(5):
+            if len(all_tweets) >= limit:
+                break
+            try:
+                if not hasattr(page, "next"):
+                    break
+                async with _X_API_SEM:
+                    page = await asyncio.wait_for(page.next(), timeout=15)
+                new = list(page)
+                if not new:
+                    break
+                all_tweets.extend(new)
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                log.debug("get_home_timeline pagination stopped: %s", e)
+                break
+
+        return self._convert_timeline(all_tweets, limit)
 
     async def get_for_you_timeline(self, limit: int = 100) -> list[RawTweet]:
         """Лента «For You» — алгоритмическая.
@@ -948,75 +1007,50 @@ class XParser:
         max_authors: int = 4,
         extra_authors: Optional[list[str]] = None,
     ) -> list[RawTweet]:
-        """Фолбэк когда SearchTimeline вернул 404.
+        """Фолбэк когда SearchTimeline вернул 404 / пусто.
 
         Приоритет:
-          1. extra_authors — handle'ы переданные вызывающим кодом (например,
-             аккаунты, которые Claude подобрал под конкретный запрос юзера —
-             они самые релевантные).
-          2. Специфичный curated по составным ключам («japanese fashion» →
-             японские fashion-издания, а не generic voguemagazine).
-          3. Широкие ключи (fashion/ai/…) — самый generic фолбэк.
+          1. `extra_authors` — handle'ы от вызывающего (обычно Claude уже
+             подобрал их под точный запрос юзера в `process_preference_request`).
+          2. Claude `suggest_authors_for_query(topic_keyword)` — для ЛЮБОЙ
+             темы модель сама даёт список реальных X-аккаунтов. Кэш на 1ч.
+             Это заменяет хардкод словарей вида `{"football": [...], ...}` —
+             те не покрывали «лоу-фай джаз», «реставрация мебели», «античная
+             философия» и тысячи других ниш.
+          3. Минимальный safety-net — если Claude/proxy лежит, отдаём
+             generic-новостные хендлы, чтобы не вернуть 0.
         """
+        from core import ai_client as _ai
+
         key = (topic_keyword or "").lower().strip()
-
-        # Сначала specific composite-keys. Более длинные/конкретные матчи идут первыми,
-        # чтобы «japanese fashion» не свалился в generic «fashion».
-        SPECIFIC: list[tuple[list[str], list[str]]] = [
-            (["japanese fashion", "japan fashion", "tokyo fashion", "harajuku", "japanese streetwear"],
-             ["hypebeastjp", "fashionsnap", "voguejapan", "highsnobiety", "nylonjapan"]),
-            (["korean fashion", "korean style", "seoul fashion", "k-fashion"],
-             ["voguekorea", "hypebaekorea", "dazedkorea", "nylonkorea"]),
-            (["luxury fashion", "runway", "couture"],
-             ["voguerunway", "businessoffashion", "netaporter"]),
-            (["streetwear"],
-             ["highsnobiety", "hypebeast", "complex"]),
-            (["ai agents", "llm", "claude"],
-             ["AnthropicAI", "OpenAI", "karpathy", "swyx"]),
-            (["crypto market", "defi", "bitcoin"],
-             ["cz_binance", "VitalikButerin", "coinbase"]),
-        ]
-        GENERIC: dict[str, list[str]] = {
-            "fashion":  ["businessoffashion", "highsnobiety"],
-            "ai":       ["AnthropicAI", "OpenAI", "GoogleDeepMind"],
-            "crypto":   ["cz_binance", "VitalikButerin"],
-            "tech":     ["techcrunch", "verge"],
-            "science":  ["nature", "ScienceMagazine", "NASA"],
-            "gaming":   ["IGN", "polygon"],
-            "sports":   ["espn", "SportsCenter"],
-            "politics": ["Reuters", "FinancialTimes"],
-            "business": ["FinancialTimes", "WSJ"],
-            "news":     ["Reuters", "AP"],
-            "culture":  ["newyorker", "Pitchfork"],
-            "music":    ["Pitchfork", "rollingstone"],
-        }
-
         picked: list[str] = []
-        # 1) extra_authors (от вызывающего — обычно от Claude).
+
+        # 1) Caller-supplied (Claude уже подобрал в preferences-флоу).
         for a in (extra_authors or []):
-            if a and a not in picked:
+            if a and a.lower() not in {p.lower() for p in picked}:
                 picked.append(a)
 
-        # 2) Specific composite matches.
-        for markers, authors in SPECIFIC:
-            if any(m in key for m in markers):
-                for a in authors:
-                    if a not in picked:
+        # 2) Claude per-query suggestion (cached). Только если caller не
+        # дал достаточно — иначе Claude-suggested от preferences важнее.
+        if len(picked) < max_authors and key:
+            try:
+                claude_handles = await _ai.suggest_authors_for_query(
+                    topic_keyword, n=max_authors,
+                )
+                for a in claude_handles:
+                    if a.lower() not in {p.lower() for p in picked}:
                         picked.append(a)
-                break  # один специфичный набор достаточно
+                    if len(picked) >= max_authors:
+                        break
+            except Exception as e:
+                log.debug("suggest_authors_for_query(%r) failed: %s", topic_keyword, e)
 
-        # 3) Generic single-word — только если specific не дал вообще ничего
-        # и без extra_authors совсем пусто.
-        if len(picked) < 2:
-            for kw, authors in GENERIC.items():
-                if kw in key:
-                    for a in authors:
-                        if a not in picked:
-                            picked.append(a)
-                    break
-
+        # 3) Last-resort safety-net — generic новостные источники, только
+        # если Claude вообще ничего не дал (offline/proxy down). Не пытаемся
+        # подобрать «правильный» tag — просто хоть что-то вместо пустоты.
         if not picked:
-            return []
+            picked = ["Reuters", "AP", "FinancialTimes"]
+
         picked = picked[:max_authors]
 
         out: list[RawTweet] = []
@@ -1135,6 +1169,31 @@ class XParser:
             except Exception as e:
                 log.debug("reply convert failed: %s", e)
         return out
+
+    async def get_tweet_with_media(self, tweet_id: str) -> Optional[RawTweet]:
+        """Легковесный fetch одного твита по id — для t.co expansion в delivery.
+
+        Когда юзеру отправляется пост вида «implementation by @kianbazza t.co/X»
+        без своего медиа, а у kianbazza видео — мы достаём kianbazza-твит
+        и берём его media. Один X-запрос, кэшируем не надо (delivery редкий).
+        """
+        if not tweet_id:
+            return None
+        client = await self._ensure_client()
+        try:
+            async with _X_API_SEM:
+                tw = await asyncio.wait_for(
+                    client.get_tweet_by_id(tweet_id), timeout=12,
+                )
+        except Exception as e:
+            log.debug("get_tweet_with_media(%s): %s", tweet_id, str(e)[:120])
+            return None
+        try:
+            uname = getattr(getattr(tw, "user", None), "screen_name", None) or "unknown"
+            return _convert_tweet(tw, uname)
+        except Exception as e:
+            log.debug("get_tweet_with_media(%s) convert: %s", tweet_id, e)
+            return None
 
     async def search_users(self, query: str, count: int = 10) -> list[AuthorInfo]:
         """Поиск аккаунтов по ключевой фразе — для auto-add в «больше/меньше».
@@ -1504,6 +1563,24 @@ def _convert_tweet(t, fallback_author: str) -> RawTweet:
         if q_text_only:
             q_text_only = re.sub(r"\s*https?://t\.co/\S+", "", q_text_only).strip()
 
+    # Linked tweet: если в URL-entities есть expanded_url типа
+    # `https://x.com/<user>/status/<id>` — это значит автор embed'ит чужой
+    # твит через t.co (не native quote). Сохраняем target id, чтобы delivery
+    # мог подтянуть его медиа когда у текущего поста медиа нет.
+    linked_tweet_id_val = None
+    url_entities = getattr(t, "urls", None) or []
+    for ue in url_entities:
+        expanded = (
+            ue.get("expanded_url") if isinstance(ue, dict)
+            else getattr(ue, "expanded_url", None)
+        )
+        if not expanded:
+            continue
+        m = re.search(r"(?:twitter|x)\.com/[^/]+/status/(\d{5,25})", expanded)
+        if m:
+            linked_tweet_id_val = m.group(1)
+            break
+
     return RawTweet(
         tweet_id=tweet_id,
         author_username=author_username,
@@ -1522,6 +1599,7 @@ def _convert_tweet(t, fallback_author: str) -> RawTweet:
         quote_media_type=quote_media_type,
         quote_author=q_author_uname,
         quote_text=q_text_only,
+        linked_tweet_id=linked_tweet_id_val,
     )
 
 

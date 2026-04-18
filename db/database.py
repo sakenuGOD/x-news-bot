@@ -41,6 +41,7 @@ async def init_db() -> None:
             "ALTER TABLE tweets ADD COLUMN quote_text VARCHAR(1024)",
             "ALTER TABLE users ADD COLUMN blocked_authors TEXT DEFAULT '[]'",
             "ALTER TABLE sent_news ADD COLUMN quote_telegram_message_id INTEGER",
+            "ALTER TABLE tweets ADD COLUMN linked_tweet_id VARCHAR(32)",
         ):
             try:
                 await conn.exec_driver_sql(ddl)

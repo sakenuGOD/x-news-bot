@@ -74,18 +74,14 @@ def _overview_kb_meta(report: Report) -> list[tuple[int, str, str, int]]:
 
 async def _render_report(message: Message, report: Report, *, digest: bool = False,
                          force_flat: bool = False) -> None:
-    """Отправляет готовый отчёт. По умолчанию — super-topics если есть,
-    иначе плоский список тем. force_flat=True → всегда плоский.
+    """Отправляет готовый отчёт — всегда плоский список тем.
+
+    Super-topics отключены: Claude склеивал «Bitcoin + XRP + Jensen Huang» в
+    «IT/Технологии» и юзер видел абстрактные ярлыки вместо реальных тем.
+    Плоский список показывает honestly что в ленте.
     """
     text = _format_overview_text(report, digest=digest)
-    if report.super_topics and not force_flat:
-        supers_meta = [
-            (idx, st.emoji, st.name, report.posts_in_super(st.sub_ids))
-            for idx, st in enumerate(report.super_topics)
-        ]
-        kb = super_topics_kb(supers_meta)
-    else:
-        kb = report_overview_kb(_overview_kb_meta(report))
+    kb = report_overview_kb(_overview_kb_meta(report))
     await message.answer(
         text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True,
     )
@@ -101,7 +97,7 @@ async def cb_new_report(cb: CallbackQuery) -> None:
     Свежий снапшот того что сейчас обсуждают в X. Окно короткое — приоритет
     сейчасному. Upfront-выжимка Claude по топ-7 темам сразу в overview.
     """
-    await _run_report_flow(cb, source="for_you", window_hours=12.0, limit_raw=400,
+    await _run_report_flow(cb, source="for_you", window_hours=20.0, limit_raw=400,
                            auto_summarize_top=7)
 
 
@@ -423,20 +419,21 @@ async def _get_feedback(session, user_id: int, tweet_id: str) -> bool | None:
 
 @router.callback_query(F.data == "rep:feed")
 async def cb_plain_feed(cb: CallbackQuery) -> None:
-    """«Моя лента» — For You за 12ч, сгруппированная по темам.
+    """«Моя лента» — Following за 24ч, сгруппированная по темам.
 
-    Источник — For You (алгоритмический feed X), НЕ Following-хроника.
-    Живой замер показал: Following за 24ч → 11 уникальных авторов из 50
-    (@reuters × 20, @toly × 9, @theeconomist × 6 — 75% ленты); For You за
-    12ч → 48/50 уникальных авторов и топы 27-55K лайков. Following — это
-    «подписан на Reuters и получаю 20 Reuters-постов подряд», а юзер хочет
-    именно алгоритмическую ленту «что мне интересно в X», плюс interest-
-    driven добивку по темам (`build_report` делает это для source=for_you).
+    Источник — Following (хронология подписок), отличается от «📊 что
+    обсуждают» (For You). До этого фикса обе кнопки слали одно и то же
+    через for_you — юзер прямо жаловался «делают то же самое».
 
-    Окно — 12ч: алгоритм X сам поднимает «обсуждаемое» за сутки, а resize
-    до 24ч просто заливает мусором старше суток. 400 raw ~ как в cb_new_report.
+    Чтобы Following не топился доминантными аккаунтами (Reuters × 47/80
+    в живом замере), build_report делает per-author cap=3 для source='following'
+    (см. core/report.py). Это даёт реальную «лента подписок без спама от
+    одного издания».
+
+    Окно — 24ч: подписочная лента читается «за вечер/ночь/утро», в отличие
+    от For You где X сам поднимает горячее за сутки.
     """
-    await _run_report_flow(cb, source="for_you", window_hours=12.0, limit_raw=400,
+    await _run_report_flow(cb, source="following", window_hours=24.0, limit_raw=400,
                            auto_summarize_top=7)
 
 
@@ -483,7 +480,7 @@ async def cb_menu_interval(cb: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "rep:trending")
 async def cb_trending(cb: CallbackQuery) -> None:
-    """«Что обсуждают» — отчёт с более широким окном (6 часов) для discovery-режима.
+    """«Что обсуждают» — отчёт с широким окном (20 часов) для discovery-режима.
 
     Та же pipeline: timeline → trash+hype фильтр → кластеризация → именование.
     Больше времени → больше разных тем, видно что в целом обсуждается в сети
@@ -496,7 +493,7 @@ async def cb_trending(cb: CallbackQuery) -> None:
     except Exception:
         pass
 
-    status = await cb.message.answer("⏳ Смотрю что обсуждают в последние 6 часов…")
+    status = await cb.message.answer("⏳ Смотрю что обсуждают в последние 20 часов…")
 
     async def _progress(msg: str) -> None:
         try:
@@ -511,7 +508,7 @@ async def cb_trending(cb: CallbackQuery) -> None:
             return
         try:
             from core.report import build_report as _build
-            report = await _build(s, user, window_hours=6.0, progress=_progress, limit_raw=200)
+            report = await _build(s, user, window_hours=20.0, progress=_progress, limit_raw=200)
         except Exception as e:
             log.exception("trending report failed for %s", user_id)
             await status.edit_text(f"❌ Сбой: <code>{type(e).__name__}</code>",

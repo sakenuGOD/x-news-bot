@@ -45,6 +45,24 @@ _AD_RE_RU = re.compile(
     re.IGNORECASE,
 )
 
+# Обобщённые маркеры cross-platform промо / repost-фарма. Только
+# универсально-спамные фразы — ничего tied к конкретной теме (мода/спорт/AI).
+_PROMO_RE = re.compile(
+    r"(link[s]?\s+in\s+bio"
+    r"|join\s+our\s+(telegram|discord|whatsapp)"
+    r"|follow\s+(me|us)\s+for\s+more"
+    r"|tap\s+the\s+link\s+in\s+bio"
+    r"|t\.me/\w+"
+    r")",
+    re.IGNORECASE,
+)
+
+# Обобщённый NSFW / onlyfans-маркеры. Хотим резать очевидно-porn/OF только.
+_NSFW_RE = re.compile(
+    r"(only\s*fans\b|18\+|\bnsfw\b|\bporn\b|\bxxx\b)",
+    re.IGNORECASE,
+)
+
 
 def is_trash(tweet: RawTweet) -> tuple[bool, str]:
     """Возвращает (is_trash, reason). Дешёвая проверка без AI."""
@@ -66,6 +84,24 @@ def is_trash(tweet: RawTweet) -> tuple[bool, str]:
         return True, "ad_marker_en"
     if _AD_RE_RU.search(text):
         return True, "ad_marker_ru"
+
+    # Cross-platform promo (repost-farm аккаунты — 0 лайков, ссылка на свой
+    # Telegram/Discord). Проверяем и body и quote — спам бывает в обоих.
+    if _PROMO_RE.search(text):
+        return True, "cross_platform_promo"
+    if tweet.quote_text and _PROMO_RE.search(tweet.quote_text):
+        return True, "cross_platform_promo_quote"
+
+    # NSFW в цитате — юзер просил fashion, не «голый парень с Grok-промптом».
+    if tweet.quote_text and _NSFW_RE.search(tweet.quote_text):
+        return True, "nsfw_quote"
+    if _NSFW_RE.search(text):
+        return True, "nsfw_body"
+
+    # ОТКЛЮЧЁН dead-post-engagement фильтр — резал легитные посты от мелких
+    # аккаунтов в AI/IT нише (юзерские подписки типа @dejavucoder, @shawmakesmagic
+    # получают 0 лайков за 2ч, но содержат живой контент). Юзер жаловался:
+    # «он забил на мою ленту, новостей мало».
 
     # Возраст.
     if tweet.age_hours > settings.tweet_max_age_hours:

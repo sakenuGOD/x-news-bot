@@ -679,6 +679,116 @@ async def suggest_interest_queries(
         return fallback
 
 
+_AUTHORS_FOR_QUERY_CACHE: dict[str, tuple[float, list[str]]] = {}
+_AUTHORS_FOR_QUERY_TTL = 3600.0  # 1ч — авторы по теме меняются редко
+
+
+async def score_clusters_against_interests(
+    cluster_names: list[str],
+    user_interests: list[str],
+) -> list[float]:
+    """Один вызов Haiku: даём список имён кластеров + явные запросы юзера,
+    получаем 0..1 score для каждого кластера. Заменяет embedding-similarity
+    которая путает «Claude Design» с «fashion design».
+
+    Возвращает список длины len(cluster_names). При фейле — нули."""
+    n = len(cluster_names)
+    if n == 0 or not user_interests:
+        return [0.0] * n
+    enumerated = "\n".join(f"  {i}. {nm}" for i, nm in enumerate(cluster_names))
+    interests_str = ", ".join(f"«{q}»" for q in user_interests[:8])
+    system = (
+        "Ты оцениваешь релевантность тем новостной ленты явным интересам "
+        "пользователя. Возвращаешь массив чисел 0..1 для каждой темы:\n"
+        "  1.0 — тема прямо про интерес юзера («Streetwear Tokyo» при интересе "
+        "«japanese fashion» = 1.0)\n"
+        "  0.5 — смежно («Дизайн интерьеров» при интересе «fashion» = 0.5)\n"
+        "  0.0 — не связано («Claude Design релиз» — это AI продукт, не fashion = 0.0)\n"
+        "Главное правило: НЕ путай омонимы и общие слова («design», «style», "
+        "«art», «culture») — если тема явно про другую сферу (AI, политика, "
+        "крипта), score = 0 даже если есть лексическое пересечение.\n"
+        "Отвечаешь ТОЛЬКО JSON."
+    )
+    user_msg = (
+        f"Интересы пользователя: {interests_str}\n\n"
+        f"Темы:\n{enumerated}\n\n"
+        f'Верни JSON: {{"scores": [0.0, 1.0, 0.5, ...]}} — РОВНО {n} чисел в порядке тем.'
+    )
+    try:
+        reply = await _call_claude(settings.model_haiku, system, user_msg,
+                                   max_tokens=300, temperature=0.1)
+        data = _extract_json(reply)
+        if not data:
+            return [0.0] * n
+        raw = data.get("scores") if isinstance(data, dict) else None
+        if not isinstance(raw, list):
+            return [0.0] * n
+        out: list[float] = []
+        for v in raw[:n]:
+            try:
+                out.append(max(0.0, min(1.0, float(v))))
+            except (TypeError, ValueError):
+                out.append(0.0)
+        while len(out) < n:
+            out.append(0.0)
+        return out
+    except Exception as e:
+        log.warning("score_clusters_against_interests failed: %s", e)
+        return [0.0] * n
+
+
+async def suggest_authors_for_query(query: str, n: int = 6) -> list[str]:
+    """Claude подбирает X-аккаунты под произвольный запрос темы.
+
+    Заменяет хардкод-словари вида `{"football": ["espn", ...], ...}` —
+    которые не масштабируются на «лоу-фай джаз», «античная философия»,
+    «реставрация мебели» и любые нишевые темы юзеров.
+
+    Кэш на 1ч в памяти процесса — для одного и того же запроса не зовём
+    Claude повторно. Кэш per-process, рестарт обнуляет.
+    """
+    import time as _time
+    key = (query or "").lower().strip()
+    if not key:
+        return []
+    entry = _AUTHORS_FOR_QUERY_CACHE.get(key)
+    if entry and entry[0] > _time.monotonic():
+        return list(entry[1])
+
+    system = (
+        "Ты подбираешь X (Twitter) аккаунты которые активно публикуют по "
+        "указанной теме. Возвращаешь только реальных авторов которые ты "
+        "ТОЧНО знаешь существуют в X — издания, журналистов, исследователей, "
+        "комьюнити. Не путай с Instagram/TikTok/Substack — нужны именно X "
+        "хендлы. Без @, только username. Отвечаешь ТОЛЬКО JSON."
+    )
+    user_msg = (
+        f"Тема/запрос: «{query.strip()}»\n\n"
+        f"Верни JSON: {{\"handles\": [\"user1\", \"user2\", ...]}}\n"
+        f"Лимит: {n} аккаунтов. Приоритет — крупные/проверенные источники "
+        f"и известные эксперты по теме. Если тема нишевая — нишевые издания "
+        f"и микро-инфлюенсеры допустимы."
+    )
+    out: list[str] = []
+    try:
+        reply = await _call_claude(settings.model_haiku, system, user_msg,
+                                   max_tokens=300, temperature=0.3)
+        data = _extract_json(reply)
+        if data and isinstance(data, dict):
+            for h in (data.get("handles") or []):
+                if isinstance(h, str):
+                    h = h.strip().lstrip("@").strip()
+                    if h and re.fullmatch(r"[A-Za-z0-9_]{1,15}", h) and h not in out:
+                        out.append(h)
+                if len(out) >= n:
+                    break
+    except Exception as e:
+        log.warning("suggest_authors_for_query(%r) failed: %s", query, e)
+
+    _AUTHORS_FOR_QUERY_CACHE[key] = (_time.monotonic() + _AUTHORS_FOR_QUERY_TTL, out)
+    return out
+
+
 def _shorten_query(q: str, max_words: int = 3) -> str:
     """X SearchTimeline стабильно работает на 2-3 словах. 5+ слов → 404.
 

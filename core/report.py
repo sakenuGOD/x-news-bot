@@ -168,17 +168,16 @@ async def _derive_interest_queries(
     # длинных фразах, authors-fallback тянул @voguemagazine с гала-хрониками.
     #
     # Фикс: БЕРЁМ saved_search_queries буквально. Эти фразы уже короткие
-    # (2-3 слова) и конкретные — юзер сам формулировал. Claude добавляет
-    # ОДНУ свежую для разнообразия (не max_queries целиком), а не перегенерирует
-    # всё. saved_queries приоритетнее — это явный сигнал юзера.
-    import random as _random
+    # (2-3 слова) и конкретные — юзер сам формулировал.
+    #
+    # Свежесть > разнообразия. Раньше использовали random.shuffle по всей
+    # истории (до 10 запросов). Итог: если юзер 2 недели назад писал «graphic
+    # design», а сегодня «одежда» — shuffle мог поднять graphic design и
+    # лента приходила с UI-компонентами вместо fashion. Берём ПОСЛЕДНИЕ 3
+    # по порядку сохранения — они отражают текущий интерес юзера.
     from core import ai_client as _ai
 
-    # Shuffle — чтобы в разных отчётах использовались разные сохранённые фразы
-    # (у юзера их 10+: streetwear, luxury, runway trends, outfit inspo, …).
-    pool = list(saved_list)
-    _random.shuffle(pool)
-    priority = [_ai._shorten_query(q) for q in pool[:max(1, max_queries - 1)]]
+    priority = [_ai._shorten_query(q) for q in saved_list[-3:]]
     priority = [q for q in priority if q]  # выкинем пустые после _shorten_query
 
     # Claude генерит ещё одну СВЕЖУЮ фразу (чтобы лента не была полностью
@@ -244,6 +243,7 @@ async def _upsert_raw_tweets(
             quote_media_type=rt.quote_media_type,
             quote_author=rt.quote_author,
             quote_text=(rt.quote_text or "")[:1000] or None,
+            linked_tweet_id=rt.linked_tweet_id,
             embedding=e,
             source_trust_score=0.6,
             topic=topic,
@@ -386,105 +386,76 @@ async def build_report(
     except Exception as e:
         log.warning("timeline fetch failed (%s): %s", source, e)
 
-    # ---------- 1b. Interest-driven search — добираем темы по интересам юзера ----------
-    # Идея: For You не всегда покрывает ВСЕ темы которые нам интересны. Если юзер
-    # подписан на Vogue — есть сигнал «мода», и надо поискать активные посты по
-    # этой теме явно. Это делает отчёт ближе к X Stories (где темы явные).
+    # ---------- 1a. Bot-tracked authors injection (для ОБОИХ source) ----------
+    # «Моя лента» = X-Following хроника, но юзер жалуется: «попросил больше
+    # моды, добавил GQ/Esquire — а в ленте их нет». Логично: он на GQ в X сам
+    # не подписан, бот добавил их только в свою БД-таблицу FollowedAuthor.
+    # Подмешиваем последние посты bot-tracked авторов в обе ветки.
     #
-    # ТОЛЬКО для For You («Что обсуждают»). «Моя лента» (Following) — чистый
-    # поток подписок без доискивания: юзер жаловался что лента долго считается,
-    # пока бот запускает 5 search-запросов и 8 author-fetch'ей. Для Following
-    # достаточно хронологического timeline, без модификаций.
-    if source == "for_you":
-        # Обширный поиск: до 5 запросов (было 3), плюс посты от FollowedAuthor
-        # помимо X-search. Юзер жаловался: «он ищет по 1-2 поста, не делает
-        # полный чекап». 5 запросов × 90 постов = до 450 кандидатов по теме.
-        interest_queries = await _derive_interest_queries(session, user, max_queries=5)
+    # Сниженный per-author limit (было 6 → 3). При 10 bot-tracked авторах и
+    # 6 постах/автора в raw попадало 55-60 постов, и after per-author-cap=3
+    # реальная Following-лента юзера (~79 постов из подписок X) вытеснялась —
+    # AI/IT темы из настоящих подписок не образовывали кластеры. 3 поста/автор
+    # даёт ≤30 кандидатов bot-tracked, и у Following остаётся место.
+    # Bot-tracked injection — ограничиваем топ-5 самых недавно добавленных
+    # авторов × 2 поста. Было 10×3=30 — при 97 FollowedAuthor (накопленных
+    # через годы «хочу больше X») это заливало 30 постов от истории юзера,
+    # вытесняя свежую X-ленту. 5×2=10 — лёгкая подмешка от того что юзер
+    # недавно добавил, а не от всего списка.
+    from db.models import FollowedAuthor as _FA
+    fa_rows = (await session.execute(
+        select(_FA.author_username)
+        .where(_FA.user_id == user.telegram_id)
+        .order_by(desc(_FA.added_at))
+        .limit(5)
+    )).all()
+    bot_tracked = [r[0] for r in fa_rows if r[0]]
+    bot_tracked_added = 0
+    if bot_tracked:
+        await _notify(f"📥 Проверяю {len(bot_tracked)} подобранных каналов…")
+        try:
+            tracked_tweets = await parser.get_recent_tweets_for_authors(
+                bot_tracked, limit_per_author=2,
+            )
+            already_ids = {t.tweet_id for t in raw}
+            for t in tracked_tweets:
+                if t.tweet_id not in already_ids:
+                    raw.append(t)
+                    already_ids.add(t.tweet_id)
+                    bot_tracked_added += 1
+            log.info("injected %d posts from %d bot-tracked authors (source=%s)",
+                     bot_tracked_added, len(bot_tracked), source)
+            if bot_tracked_added:
+                await _notify(
+                    f"📥 Подмешал {bot_tracked_added} постов от {len(bot_tracked)} каналов…"
+                )
+        except Exception as e:
+            log.debug("bot-tracked author injection failed: %s", e)
+
+    # ---------- 1b. Interest-driven search ОТКЛЮЧЁН ----------
+    # Раньше здесь X-search по saved_queries юзера подмешивал до 450 постов
+    # по «fashion» и затоплял реальную For You ленту. Принципиально удалено:
+    # топик-бустинг теперь только через explicit FollowedAuthor (который юзер
+    # добавил через «хочу больше X»), никаких X-search инъекций.
+    # Сохраняем fallback: когда For You вернула совсем пусто (<20 постов),
+    # делаем 1 поиск чтобы отчёт не был вообще пустым.
+    if source == "for_you" and len(raw) < 20:
+        # Минимальный fallback когда For You вернула пусто: 1 search по самому
+        # последнему интересу юзера, чтобы отчёт не был вообще пустым.
+        # Не топит ленту, т.к. сюда попадаем только при len(raw)<20.
+        interest_queries = await _derive_interest_queries(session, user, max_queries=1)
         if interest_queries:
-            await _notify(f"🔎 Доискиваю темы по интересам: {', '.join(interest_queries[:3])}…")
-
-            # Готовим extra_authors: последние добавленные FollowedAuthor —
-            # это те что Claude подобрал специально под запрос юзера
-            # (например @voguejapan, @fashionsnap после «японский стиль»).
-            # Их посты — самые релевантные для нишевой темы, лучше чем curated.
-            from db.models import FollowedAuthor
-            recent_fa_rows = (await session.execute(
-                select(FollowedAuthor.author_username)
-                .where(FollowedAuthor.user_id == user.telegram_id)
-                .order_by(desc(FollowedAuthor.added_at))
-                .limit(15)
-            )).all()
-            recent_authors = [r[0] for r in recent_fa_rows]
-
+            q = interest_queries[0]
+            await _notify(f"🔎 For You пуста, беру по теме «{q}»…")
             already = {t.tweet_id for t in raw}
-            # Early-abort: если 2 первых query дали 0 результатов подряд, X-search
-            # для этой куки скорее всего «мёртв» (404 на всё) — прекращаем
-            # interest-search. Было: 5 запросов × 5 сек × 0 постов = 25 сек впустую
-            # + ещё 40 сек на 429-щие authors-fallback. Итого >60 сек на воздух.
-            consecutive_empty = 0
-            SEARCH_DEAD_THRESHOLD = 2
-            for q in interest_queries:
-                if consecutive_empty >= SEARCH_DEAD_THRESHOLD:
-                    log.info("interest-search aborted after %d empty queries in a row "
-                             "(X search 404 likely disabled for this cookie)",
-                             consecutive_empty)
-                    break
-                extra: list[RawTweet] = []
-                try:
-                    # Большой count — полноценная подборка темы.
-                    # Top-search возвращает до 40 за раз; Latest — ещё 40. После
-                    # дедупа — 50-70 уникальных постов на запрос.
-                    top = await parser.search_tweets(q, product="Top", count=40)
-                    extra.extend(top)
-                    latest = await parser.search_tweets(q, product="Latest", count=40)
-                    seen_q = {x.tweet_id for x in extra}
-                    for t in latest:
-                        if t.tweet_id not in seen_q:
-                            extra.append(t)
-                            seen_q.add(t.tweet_id)
-                except Exception as e:
-                    log.debug("interest search %s failed: %s", q, e)
-                # Если X-search ничего не дал (404 / rate-limit) — идём к авторам:
-                # recent_authors (которых Claude подобрал) приоритет, затем curated.
-                # Большой пул: 12 авторов × 10 постов = до 120 кандидатов на запрос.
-                if not extra:
-                    try:
-                        extra = await parser.topic_authors_fallback(
-                            q, per_author=10, max_authors=12,
-                            extra_authors=recent_authors,
-                        )
-                        if extra:
-                            log.info("interest search %r: authors-fallback, got %d posts",
-                                     q, len(extra))
-                    except Exception as e:
-                        log.debug("authors fallback for %r failed: %s", q, e)
-                # ДОПОЛНЯЕМ X-search постами FollowedAuthor по теме — даже если
-                # X-search сам вернул 40 постов. Добавленные каналы должны
-                # реально «весить» в результатах, а не быть декоративными.
-                # (Юзер: «подсовываю аккаунты с весом 0.1 вместо 10».)
-                if recent_authors and len(extra) < 60:
-                    try:
-                        author_extra = await parser.get_recent_tweets_for_authors(
-                            recent_authors[:6], limit_per_author=5,
-                        )
-                        extra_ids = {x.tweet_id for x in extra}
-                        for t in author_extra:
-                            if t.tweet_id not in extra_ids:
-                                extra.append(t)
-                                extra_ids.add(t.tweet_id)
-                    except Exception as e:
-                        log.debug("extra author-fetch for %r failed: %s", q, e)
-                # Считаем «пустой» query для early-abort — если ни search, ни
-                # authors-fallback ничего не вернули, это сигнал что X режет эту куку.
-                if not extra:
-                    consecutive_empty += 1
-                else:
-                    consecutive_empty = 0
+            try:
+                extra = await parser.search_tweets(q, product="Top", count=25)
                 for t in extra:
                     if t.tweet_id not in already:
                         raw.append(t)
                         already.add(t.tweet_id)
-                await asyncio.sleep(0.4)  # щадящий ритм, X любит rate-limit
+            except Exception as e:
+                log.debug("fallback search(%s) failed: %s", q, e)
 
     # Для Following — режем по времени (окно). Для For You — нет: X-алгоритм
     # ранжирует НЕ по времени и часто поднимает посты 1-3 дня давности если
@@ -496,6 +467,31 @@ async def build_report(
             t for t in raw
             if (t.created_at if t.created_at.tzinfo else t.created_at.replace(tzinfo=timezone.utc)) >= cutoff
         ]
+        # Per-author dedup: в Following-фетче подписочные аккаунты-новостники
+        # (Reuters/TheEconomist/AP) генерят десятки постов в окне — без cap
+        # они занимают 75%+ ленты и юзеру кажется что моя-лента =
+        # «Reuters спам». Замер: Reuters 47/80 постов. С cap=3 — лента
+        # становится разнообразной, остальные подписки просвечивают.
+        # Cap был 5 — из 400 постов 33 уникальных автора давали только 93 поста
+        # в кластеризацию, многие темы разваливались. 8 — Reuters/TheEconomist
+        # естественно образуют «News» кластер из 8 постов (легитно если юзер
+        # подписан), остальные подписки тоже больше просвечивают.
+        MAX_PER_AUTHOR = 8
+        seen_per_author: dict[str, int] = {}
+        capped: list[RawTweet] = []
+        # Сортируем по engagement сначала — топовые посты автора важнее
+        # хвоста (5-й/6-й Reuters пост за день — мусор).
+        raw_sorted = sorted(raw, key=lambda t: t.likes_count + 2 * t.retweets_count, reverse=True)
+        for t in raw_sorted:
+            key = (t.author_username or "").lower()
+            cnt = seen_per_author.get(key, 0)
+            if cnt >= MAX_PER_AUTHOR:
+                continue
+            seen_per_author[key] = cnt + 1
+            capped.append(t)
+        log.info("following: per-author cap %d → kept %d of %d (unique authors=%d)",
+                 MAX_PER_AUTHOR, len(capped), len(raw), len(seen_per_author))
+        raw = capped
     fetched = len(raw)
 
     # Demo fallback — если X вернул пусто.
@@ -570,37 +566,92 @@ async def build_report(
     tweet_map = await _upsert_raw_tweets(session, pairs)
     tweets: list[Tweet] = [tweet_map[rt.tweet_id] for rt, _ in pairs if rt.tweet_id in tweet_map]
 
+    # ---------- 5b. Pending boost tweets (от «хочу больше X» immediate-fetch) ----------
+    # preferences.py сохраняет tweet_ids подтянутых постов в
+    # user.onboarding_payload["pending_boost_ids"]. Подмешиваем ограниченное
+    # количество (MAX_PENDING=20) чтобы не затопить реальную X-ленту:
+    # 76 fashion-постов vs 100 For You делали fashion доминантой. 20 — это
+    # supplement, реальная лента остаётся основой.
+    MAX_PENDING = 20
+    _payload = dict(user.onboarding_payload or {})
+    pending_boost_ids = list(_payload.get("pending_boost_ids") or [])
+    if pending_boost_ids:
+        existing_tids = {t.tweet_id for t in tweets}
+        fresh_ids = [
+            tid for tid in pending_boost_ids
+            if tid not in existing_tids and tid not in sent_ids
+        ]
+        boost_added = 0
+        if fresh_ids:
+            # Берём только ПЕРВЫЕ MAX_PENDING — это самые свежие upsert'ы
+            # (preferences.py кладёт новые в начало списка).
+            rows = (await session.execute(
+                select(Tweet).where(Tweet.tweet_id.in_(fresh_ids[:MAX_PENDING * 2]))
+            )).all()
+            # Сохраняем порядок по свежести
+            by_id = {r[0].tweet_id: r[0] for r in rows}
+            for tid in fresh_ids:
+                if boost_added >= MAX_PENDING:
+                    break
+                t = by_id.get(tid)
+                if t and t.embedding:
+                    tweets.append(t)
+                    boost_added += 1
+        log.info("pending boost: %d ids → %d added (cap=%d)",
+                 len(pending_boost_ids), boost_added, MAX_PENDING)
+        # Чистим pending после использования.
+        _payload["pending_boost_ids"] = []
+        user.onboarding_payload = _payload
+        await session.flush()
+
     # ---------- 6. Cluster ----------
+    # Для Following сразу стартуем с min_cluster_size=2: подписочная лента
+    # тоньше (100 постов × per-author cap=3), темы там естественно мельче.
+    # Раньше два прохода (3 → retry 2) давали те же результаты но в 2x время.
+    # Для For You оставляем 3 как первый проход — там контента в 3-5x больше,
+    # size=3 даёт более чистые темы, без шума.
+    #
+    # Следовая «сила boost» тоже разная: Following должен уважать реальные
+    # подписки юзера (его AI-подписки не должны задавливаться saved_queries=
+    # [fashion,...]). Для for_you boost×4 — агрессивный, для following ×1.5
+    # — мягкий, чтобы размер кластера (сколько подписок вообще про тему
+    # пишут) доминировал.
     await _notify(f"🗂 Группирую в темы…")
-    clusters, unclustered_ids = await _cluster_and_name(session, tweets, user, progress=_notify)
+    # Boost_multiplier=0 — отключаем re-ranking по saved_queries. Кластеры
+    # выигрывают размером: сколько постов на тему в реальной X-ленте, столько
+    # и показываем. Без этого юзер жалуется: «3-постный fashion затоптал
+    # 12-постный AI». Работает одинаково для любого юзера — код не знает
+    # какие у него интересы, ленте виднее.
+    if source == "following":
+        clusters, unclustered_ids = await _cluster_and_name(
+            session, tweets, user, progress=_notify,
+            min_cluster_size=2, boost_multiplier=0.0,
+        )
+    else:
+        clusters, unclustered_ids = await _cluster_and_name(
+            session, tweets, user, progress=_notify,
+            boost_multiplier=0.0,
+        )
 
     # Adaptive retry: если получилось <5 тем (то что юзер называет «анемичный
     # отчёт — всего 2 темы»), снижаем min_cluster_size до 2 и пересчитываем.
     # Пары связанных постов (2 штуки) образуют темы — отчёт становится
     # пышнее. С cap_per_cluster=8 это безопасно: нельзя получить «тему из 50».
+    # Для Following уже стартовали с 2 — retry не нужен.
     MIN_TARGET_TOPICS = 5
-    if len(clusters) < MIN_TARGET_TOPICS and len(tweets) >= 6:
+    if (source != "following"
+            and len(clusters) < MIN_TARGET_TOPICS and len(tweets) >= 6):
         await _notify(f"🔬 Тем мало ({len(clusters)}), дроблю мелкие группы…")
         clusters, unclustered_ids = await _cluster_and_name(
             session, tweets, user, progress=_notify, min_cluster_size=2,
         )
         log.info("adaptive retry with min_cluster_size=2: got %d topics", len(clusters))
 
-    # ---------- 6a. Super-topic grouping ----------
-    # Claude объединяет 8-10 конкретных тем в 3-5 широких категорий (IT, Мода,
-    # Спорт, ...). Overview показывает супер-категории, клик по ним — сами темы.
+    # ---------- 6a. Super-topic grouping ОТКЛЮЧЕНО ----------
+    # Claude группировал «Bitcoin + XRP + Jensen Huang» в «IT/Технологии» —
+    # юзер видел абстрактные ярлыки и думал что бот пропустил его реальные
+    # темы. Показываем плоский список (реальные имена кластеров).
     super_topics: list[SuperTopic] = []
-    if len(clusters) >= 3:
-        await _notify("🧭 Собираю в широкие категории…")
-        pairs = [(c.id, c.emoji, c.name) for c in clusters]
-        try:
-            grouped = await ai_client.group_super_topics(pairs)
-            for g in grouped:
-                super_topics.append(SuperTopic(
-                    emoji=g["emoji"], name=g["name"], sub_ids=list(g["sub_ids"]),
-                ))
-        except Exception as e:
-            log.debug("super_topic grouping failed: %s", e)
 
     # ---------- 6b. Upfront summaries (digest mode) ----------
     # Сразу саммаризуем топ-N кластеров параллельно, чтобы overview показывал не
@@ -668,6 +719,7 @@ async def _cluster_and_name(
     max_topics: int = 12,
     min_cluster_size: int = 3,
     cap_per_cluster: int = 8,
+    boost_multiplier: float = 4.0,
 ) -> tuple[list[ReportCluster], list[str]]:
     """Кластеризация tweets + Claude-именование + merge похожих.
 
@@ -777,28 +829,84 @@ async def _cluster_and_name(
                 surviving_named.append(nm)
             groups, named = surviving_groups, surviving_named
 
-    # --- Stage 4: сортируем по размеру, обрезаем до max_topics, хвост → «Разное» ---
-    order = sorted(range(len(groups)), key=lambda i: len(groups[i]), reverse=True)
+    # --- Stage 4: ranking + per-cluster cap, weighted by user interest ---
+    #
+    # Проблема старого подхода (sorted by len): модный кластер из 5 проигрывал
+    # AI-кластеру из 20, даже когда юзер явно сказал «больше моды». Cap=8
+    # одинаковый — юзер видел 8 модных постов, хотя бот вытянул 40.
+    #
+    # Старый topic_clusters-based boost тоже не работал: nearest_cluster()
+    # ставил «lifestyle» на «уличную еду» и «culture» на «UI компоненты»
+    # потому что embeddings схожи — boost получали не те темы.
+    #
+    # Теперь:
+    #   1. Берём явные интересы юзера (saved_search_queries — что он сам
+    #      печатал в «хочу больше …»).
+    #   2. Эмбеддим эти запросы.
+    #   3. Для каждого кластера считаем cosine sim его НАЗВАНИЯ к queries.
+    #      Топ-1 sim = boost. Это бьёт точно: «уличная мода снимки» близко
+    #      к «street style», но «уличная еда» — нет.
+    #   4. ranking_score = (size + 5) × (1 + boost × 4) — формула размывает
+    #      разрыв 2 vs 8 постов и даёт boost реально решать.
+    #   5. cap_per_cluster: 8 → 18 для clusters с sim > 0.4.
+    payload = user.onboarding_payload or {}
+    saved_queries: list[str] = []
+    if isinstance(payload, dict):
+        sq = payload.get("saved_search_queries") or []
+        saved_queries = [q for q in sq if isinstance(q, str) and q.strip()][-10:]
+
+    # Interest-ranking через Claude: вызов только если boost_multiplier>0.
+    # Когда мультипликатор = 0, результаты никак не влияют на порядок —
+    # экономим Claude-вызов и пол-секунды времени.
+    cluster_score: list[float] = [0.0] * len(groups)
+    if boost_multiplier > 0 and saved_queries and groups:
+        try:
+            cluster_score = await ai_client.score_clusters_against_interests(
+                [n for (_e, n) in named], saved_queries,
+            )
+        except Exception as ex:
+            log.debug("score_clusters_against_interests failed: %s", ex)
+
+    cluster_meta = []
+    for i, grp in enumerate(groups):
+        boost = cluster_score[i] if i < len(cluster_score) else 0.0
+        # `min(size, 12)` ограничивает влияние гигантских кластеров (Claude
+        # Design × 50) — без cap'а размер сжирает любой boost. +5 размывает
+        # разрыв 2 vs 8 постов. boost_multiplier: для For You=4.0 (агрессивный
+        # boost — saved-queries доминируют), для Following=1.5 (мягкий —
+        # размер кластера из подписок важнее заявленных интересов, иначе
+        # AI-подписки юзера задавливаются когда он поставил «хочу больше моды»).
+        weighted = (min(len(grp), 12) + 5) * (1.0 + boost * boost_multiplier)
+        cluster_meta.append((i, boost, weighted))
+
+    cluster_meta.sort(key=lambda x: x[2], reverse=True)
+    order = [m[0] for m in cluster_meta]
+    boost_by_orig = {m[0]: m[1] for m in cluster_meta}
+    if saved_queries and any(b > 0 for _, b, _ in cluster_meta):
+        top_dbg = [(named[i][1], round(boost_by_orig[i], 2)) for i in order[:6]]
+        log.info("interest-ranked clusters (saved=%s): %s", saved_queries[:3], top_dbg)
+
     groups = [groups[i] for i in order]
     named = [named[i] for i in order]
+    boosts = [boost_by_orig[i] for i in order]
 
     top_groups = groups[:max_topics]
     top_named = named[:max_topics]
+    top_boosts = boosts[:max_topics]
     rest = [i for grp in groups[max_topics:] for i in grp]
     if len(rest) >= min_cluster_size:
         top_groups.append(rest)
         top_named.append(("📰", "Остальное"))
+        top_boosts.append(0.0)
 
-    # Cap per cluster — в каждой теме оставляем топ-N по _score_for_ordering
-    # (медиа+свежесть+relevance). Юзеру важно видеть 5-8 лучших постов темы,
-    # а не 50 «Claude Design» подряд. Остаток выпадает — в следующий отчёт.
-    # Тест-замер For You показал: 6+ постов в топ-10 про «Claude Design»,
-    # без cap'а один кластер сжирал ~40% ленты и остальные темы выглядели
-    # анемичными (3-4 поста vs 12). Cap уравнивает вес тем для юзера.
     out: list[ReportCluster] = []
-    for cid, (grp, (emoji, name)) in enumerate(zip(top_groups, top_named)):
+    for cid, (grp, (emoji, name), boost) in enumerate(zip(top_groups, top_named, top_boosts)):
+        # Boosted-кластер: cap 8→18, юзер видит реально много контента темы
+        # которую он сам попросил. Порог 0.5 — Claude должен явно отметить
+        # тему как релевантную (не на полпути).
+        effective_cap = cap_per_cluster + (10 if boost >= 0.5 else 0)
         sorted_idx = sorted(grp, key=lambda i: _score_for_ordering(tweets[i], user_vec), reverse=True)
-        capped = sorted_idx[:cap_per_cluster] if cap_per_cluster > 0 else sorted_idx
+        capped = sorted_idx[:effective_cap] if effective_cap > 0 else sorted_idx
         out.append(ReportCluster(
             id=cid,
             emoji=emoji,

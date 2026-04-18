@@ -490,11 +490,29 @@ async def send_one_tweet(
         # Тип неизвестен но URL есть — пробуем photo как безопасный дефолт.
         media_type = "photo"
 
+    # T.co expansion: пост содержит t.co-ссылку на ДРУГОЙ статус-твит
+    # (типичный «implementation by @kianbazza t.co/X» где видео физически
+    # у kianbazza, а в нашем посте только текст). Тянем медиа связанного
+    # твита on-demand. Только если у нас СВОЕГО медиа нет — иначе у юзера
+    # бы пропадало родное фото.
+    media_url_eff = tweet.image_url
+    if not media_url_eff and getattr(tweet, "linked_tweet_id", None):
+        try:
+            from core.x_parser import parser as _parser
+            linked = await _parser.get_tweet_with_media(tweet.linked_tweet_id)
+            if linked and linked.image_url:
+                media_url_eff = linked.image_url
+                media_type = linked.media_type or "photo"
+                log.info("t.co expansion: tweet %s → media from linked %s (%s)",
+                         tweet.tweet_id, tweet.linked_tweet_id, media_type)
+        except Exception as e:
+            log.debug("t.co expansion failed for %s: %s", tweet.tweet_id, e)
+
     msg = None
-    if tweet.image_url and media_type in ("photo", "video", "animation"):
+    if media_url_eff and media_type in ("photo", "video", "animation"):
         msg = await _send_media_with_fallback(
             bot, user_id,
-            media_url=tweet.image_url,
+            media_url=media_url_eff,
             media_type=media_type,
             caption=caption,
             reply_markup=kb,

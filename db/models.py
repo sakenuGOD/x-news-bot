@@ -80,6 +80,13 @@ class Tweet(Base):
     quote_author: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     quote_text: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
 
+    # Если в тексте была t.co-ссылка указывающая на другой статус-твит
+    # (RT/embed без native quote_status_id) — сохраняем target tweet_id.
+    # Используется в delivery: если у поста нет своего медиа, тянем медиа
+    # связанного твита (типичный кейс: «implementation by @kianbazza t.co/...»
+    # с видео в kianbazza-посте, но без него в текущем).
+    linked_tweet_id: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+
     # Embedding 1536-мерный — как JSON, чтобы был backup (Chroma вторична).
     embedding: Mapped[Optional[list[float]]] = mapped_column(JSON, nullable=True)
     summary_ru: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
