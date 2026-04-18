@@ -10,7 +10,7 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.types import CallbackQuery
 
 from bot.delivery import format_caption
-from bot.keyboards import feedback_kb, resume_kb, topic_paginator_kb
+from bot.keyboards import comments_kb, feedback_kb, resume_kb, topic_paginator_kb
 from config import settings
 from core import ai_client
 from core import embeddings as emb
@@ -472,18 +472,58 @@ async def handle_comments(cb: CallbackQuery) -> None:
     # Есть комменты — отвечаем нормальным bubble и ТРЕКАЕМ его message_id.
     await cb.answer("Достаю комменты…")
 
+    text_en = _format_comments_block(replies)
+    # Кэшируем оригинал и перевод в in-process dict, чтобы клик на 🇷🇺/🇬🇧
+    # не тянул Claude повторно.
+    _COMMENTS_CACHE[(cb.from_user.id, tweet_id)] = {
+        "en": text_en, "ru": None, "replies": replies,
+    }
+    kb = comments_kb(tweet_id, translated=False)
+    try:
+        sent = await cb.message.reply(
+            text_en, parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True, reply_markup=kb,
+        )
+        _track_bubble(cb.from_user.id, sent.message_id)
+    except TelegramAPIError as e:
+        log.debug("comments reply failed: %s", e)
+
+
+# (user_id, tweet_id) → {"en": str, "ru": str|None, "replies": [RawReply,...]}
+_COMMENTS_CACHE: dict[tuple[int, str], dict] = {}
+
+
+def _format_comments_block(replies) -> str:
+    """Форматирует список реплаев с полным сохранением URL.
+
+    Резание на 300 символов ломало ссылки которые часто стоят в конце
+    коммента («Grab your guide here: → <url>» → «...here: → …»). Теперь
+    режем мягче: лимит 360 символов, но срез обязан упасть на пробел,
+    и если после реза URL остался оборванным — откатываемся на полный
+    текст (в 99% случаев это ≤ 500 chars, Telegram выдерживает).
+    """
     import html as _html
+    import re as _re
     lines = ["<b>💬 Топ комментариев</b>", ""]
     for i, r in enumerate(replies, 1):
         txt = (r.text or "").strip()
-        if len(txt) > 300:
-            txt = txt[:299].rstrip() + "…"
+        if len(txt) > 360:
+            cut = txt.rfind(" ", 0, 360)
+            if cut < 200:
+                cut = 360
+            truncated = txt[:cut].rstrip()
+            tail = txt[cut:]
+            # Если хвост содержит URL — оставляем полностью, не режем
+            # (редкий случай, но ссылка важнее лимита).
+            if _re.search(r"https?://\S+", tail):
+                truncated = txt
+            txt = truncated if truncated == txt else truncated + "…"
         r_author = _html.escape(r.author_username or "—")
         body = _html.escape(txt)
         stats = []
-        if r.likes_count >= 5:
+        if getattr(r, "likes_count", 0) and r.likes_count >= 5:
             stats.append(f"❤️ {r.likes_count}")
-        if r.retweets_count >= 3:
+        if getattr(r, "retweets_count", 0) and r.retweets_count >= 3:
             stats.append(f"🔁 {r.retweets_count}")
         stat = " · ".join(stats)
         lines.append(f"<b>{i}. @{r_author}</b>" + (f"  <i>{stat}</i>" if stat else ""))
@@ -492,12 +532,72 @@ async def handle_comments(cb: CallbackQuery) -> None:
     text = "\n".join(lines).strip()
     if len(text) > 4000:
         text = text[:3990].rstrip() + "…"
+    return text
+
+
+@router.callback_query(F.data.startswith("cmtr:"))
+async def handle_comments_translate(cb: CallbackQuery) -> None:
+    """Переключатель языка для блока комментов.
+
+    Клик 🇷🇺 → Claude переводит на русский (batch, один вызов), клик 🇬🇧 →
+    возвращаем оригинал из кэша. Перевод лениво кэшируется на сессию.
+    """
     try:
-        sent = await cb.message.reply(text, parse_mode=ParseMode.HTML,
-                                      disable_web_page_preview=True)
-        _track_bubble(cb.from_user.id, sent.message_id)
+        _, direction, tweet_id = cb.data.split(":", 2)
+    except ValueError:
+        await cb.answer()
+        return
+
+    key = (cb.from_user.id, tweet_id)
+    cached = _COMMENTS_CACHE.get(key)
+    if not cached:
+        await cb.answer("Комментарии устарели, открой заново.", show_alert=True)
+        return
+
+    if direction == "en":
+        # Вернуться к оригиналу — без Claude, просто edit_text.
+        try:
+            await cb.message.edit_text(
+                cached["en"], parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=comments_kb(tweet_id, translated=False),
+            )
+        except TelegramAPIError as e:
+            log.debug("comments back-to-en edit failed: %s", e)
+        await cb.answer()
+        return
+
+    # direction == "ru": если уже в кэше — показываем, иначе переводим.
+    ru = cached.get("ru")
+    if not ru:
+        await cb.answer("Перевожу…")
+        replies = cached["replies"]
+        texts = [(r.text or "").strip() for r in replies]
+        try:
+            translations = await ai_client.translate_batch(texts, target="ru")
+        except Exception as e:
+            log.warning("comments translate failed: %s", e)
+            await cb.answer("Перевод не удался, попробуй позже.", show_alert=True)
+            return
+        # Собираем с переведёнными текстами но теми же meta.
+        translated_replies = []
+        for orig, tr in zip(replies, translations):
+            r_copy = type(orig).__new__(type(orig))
+            r_copy.__dict__.update(orig.__dict__)
+            r_copy.text = tr or orig.text
+            translated_replies.append(r_copy)
+        ru = _format_comments_block(translated_replies)
+        cached["ru"] = ru
+
+    try:
+        await cb.message.edit_text(
+            ru, parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=comments_kb(tweet_id, translated=True),
+        )
     except TelegramAPIError as e:
-        log.debug("comments reply failed: %s", e)
+        log.debug("comments ru edit failed: %s", e)
+    await cb.answer()
 
 
 # ----------------------------- Pause / Resume -----------------------------

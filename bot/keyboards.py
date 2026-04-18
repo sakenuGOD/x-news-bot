@@ -223,6 +223,21 @@ def topic_view_kb(cluster_id: int, has_more: bool = False) -> InlineKeyboardMark
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def comments_kb(tweet_id: str, translated: bool = False) -> InlineKeyboardMarkup:
+    """Клавиатура под сообщением с топ-комментами.
+
+    Одна кнопка переключения языка (🇷🇺 Перевод / 🇬🇧 Оригинал) — Claude
+    переводит весь блок комментов разом и кэширует в per-session state.
+    """
+    lang_txt = "🇬🇧 Оригинал" if translated else "🇷🇺 Перевод"
+    lang_cb = (
+        f"cmtr:en:{tweet_id}" if translated else f"cmtr:ru:{tweet_id}"
+    )
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=lang_txt, callback_data=lang_cb),
+    ]])
+
+
 def topic_paginator_kb(
     cluster_id: int,
     pos: int,

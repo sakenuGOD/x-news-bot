@@ -402,12 +402,16 @@ async def build_report(
     # через годы «хочу больше X») это заливало 30 постов от истории юзера,
     # вытесняя свежую X-ленту. 5×2=10 — лёгкая подмешка от того что юзер
     # недавно добавил, а не от всего списка.
+    # Берём 10 самых недавно добавленных авторов (было 5) × 3 поста (было 2)
+    # = до 30 подмешанных. Юзер жаловался: «попросил больше моды, добавил 2
+    # автора, и в ленте только они» — шире охват лечит это. 10×3=30 на фоне
+    # 100-400 основной ленты = ~8% — не затапливает.
     from db.models import FollowedAuthor as _FA
     fa_rows = (await session.execute(
         select(_FA.author_username)
         .where(_FA.user_id == user.telegram_id)
         .order_by(desc(_FA.added_at))
-        .limit(5)
+        .limit(10)
     )).all()
     bot_tracked = [r[0] for r in fa_rows if r[0]]
     bot_tracked_added = 0
@@ -415,7 +419,7 @@ async def build_report(
         await _notify(f"📥 Проверяю {len(bot_tracked)} подобранных каналов…")
         try:
             tracked_tweets = await parser.get_recent_tweets_for_authors(
-                bot_tracked, limit_per_author=2,
+                bot_tracked, limit_per_author=3,
             )
             already_ids = {t.tweet_id for t in raw}
             for t in tracked_tweets:
@@ -605,10 +609,11 @@ async def build_report(
     # ---------- 5b. Pending boost tweets (от «хочу больше X» immediate-fetch) ----------
     # preferences.py сохраняет tweet_ids подтянутых постов в
     # user.onboarding_payload["pending_boost_ids"]. Подмешиваем ограниченное
-    # количество (MAX_PENDING=20) чтобы не затопить реальную X-ленту:
-    # 76 fashion-постов vs 100 For You делали fashion доминантой. 20 — это
-    # supplement, реальная лента остаётся основой.
-    MAX_PENDING = 20
+    # количество (MAX_PENDING=40) чтобы темы boost-запроса реально
+    # кластеризовались, а не растворялись в основной ленте. Юзер жаловался:
+    # «подтянул 53 поста, но в отчёте только 2 темы моды и те от 2 авторов»
+    # — 20 было слишком мало, пост-кластеризация не видела критической массы.
+    MAX_PENDING = 40
     _payload = dict(user.onboarding_payload or {})
     pending_boost_ids = list(_payload.get("pending_boost_ids") or [])
     if pending_boost_ids:
@@ -802,6 +807,25 @@ async def _cluster_and_name(
     # --- Stage 1: raw clustering, LOW threshold — широкая группировка ---
     clusters_idx = _cosine_union_find(vectors, threshold=0.42)
     user_vec = user.preference_vector
+
+    # Adaptive refinement: если одна компонента поглотила >60% всех векторов,
+    # это chaining — embeddings смежных тем транзитивно связаны (Claude
+    # Opus / Claude Design / Claude Code / AI benchmarks — все по 0.43-0.48
+    # друг к другу, union-find сшивает в 1 блоб). Рекластеризуем эту
+    # компоненту с более строгим порогом, чтобы увидеть отдельные темы.
+    total_n = len(vectors)
+    largest = max(clusters_idx, key=len) if clusters_idx else []
+    if total_n >= 20 and len(largest) > int(total_n * 0.6):
+        sub_vectors = [vectors[i] for i in largest]
+        sub_clusters = _cosine_union_find(sub_vectors, threshold=0.50)
+        if len(sub_clusters) >= 2:
+            # Заменяем гигант её под-компонентами (индексы в исходных tweets).
+            refined = [c for c in clusters_idx if c is not largest]
+            for sub in sub_clusters:
+                refined.append([largest[i] for i in sub])
+            clusters_idx = refined
+            log.info("adaptive recluster: broke giant %d → %d sub-clusters at th=0.50",
+                     len(largest), len(sub_clusters))
 
     large: list[list[int]] = [c for c in clusters_idx if len(c) >= min_cluster_size]
     small: list[list[int]] = [c for c in clusters_idx if len(c) < min_cluster_size]

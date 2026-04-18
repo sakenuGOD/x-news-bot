@@ -520,14 +520,24 @@ async def send_one_tweet(
         )
 
     if msg is None:
-        # Финальный fallback — текст вместо медиа.
+        # Финальный fallback — текст вместо медиа. Когда медиа было но
+        # не ушло (4K-видео >45MB лимита / 403 на url-mode / etc), юзер
+        # иначе не видит что там вообще было видео. Добавляем явную
+        # ссылку «🎥 Видео на X» к caption, чтобы кликом открыть оригинал.
+        text_with_hint = caption
+        if media_url_eff and media_type in ("video", "animation") and tweet.url:
+            hint_line = f'\n\n🎥 <a href="{html.escape(tweet.url)}">Открыть видео в X</a>'
+            # Резерв под hint чтобы не обрезать текст.
+            budget = TEXT_MESSAGE_LIMIT - len(hint_line) - 16
+            base = caption if len(caption) <= budget else caption[:budget].rstrip() + "…"
+            text_with_hint = base + hint_line
         try:
             msg = await bot.send_message(
                 chat_id=user_id,
-                text=caption[:TEXT_MESSAGE_LIMIT],
+                text=text_with_hint[:TEXT_MESSAGE_LIMIT],
                 reply_markup=kb,
                 parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
+                disable_web_page_preview=False,  # preview ок — юзер увидит кадр
             )
         except TelegramAPIError as e:
             log.error("send fallback failed for %s: %s", tweet.tweet_id, e)

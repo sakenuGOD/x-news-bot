@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -508,6 +509,42 @@ async def analyze_interests_text(text: str) -> OnboardingAnalysis:
 
 
 # --------------------- 5. translate_to_ru (Haiku, кэшируется) ---------------
+
+
+async def translate_batch(texts: Sequence[str], target: str = "ru") -> list[str]:
+    """Параллельный перевод списка текстов. 7 реплаев параллельно через asyncio
+    — ~5с суммарно, вместо 30с последовательно. Падение отдельного перевода
+    возвращает оригинал (не блокирует остальные)."""
+    if not texts:
+        return []
+    coros = [translate_to_ru(t) if target == "ru" else translate_to_en(t) for t in texts]
+    results = await asyncio.gather(*coros, return_exceptions=True)
+    out: list[str] = []
+    for orig, res in zip(texts, results):
+        if isinstance(res, Exception) or not res:
+            out.append(orig)
+        else:
+            out.append(res)
+    return out
+
+
+async def translate_to_en(text: str) -> str:
+    """Обратный перевод — редко, но надо для симметрии (user clicks 🇬🇧 if he
+    изначально видел уже переведенную версию)."""
+    if not text or not text.strip():
+        return text
+    system = (
+        "Translate posts from Russian to English. Preserve tone, "
+        "emphasis, meaning. Translate naturally, not word-for-word. "
+        "NO preamble, NO quotes, NO explanations — clean translation only."
+    )
+    user = f"Translate to English:\n\n{text}"
+    try:
+        reply = await _call_claude(settings.model_haiku, system, user, max_tokens=700, temperature=0.3)
+        return reply.strip().strip('"').strip("«»").strip() or text
+    except Exception as e:
+        log.warning("translate_to_en failed: %s", e)
+        return text
 
 
 async def translate_to_ru(text: str) -> str:
