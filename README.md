@@ -1,73 +1,138 @@
 # x-news-bot
 
-Телеграм-бот, который превращает твой X/Twitter feed в дайджест тем с постами. Тянет ленту (For You и Following), фильтрует мусор, кластеризует по смыслу через embeddings, даёт Claude назвать тему и написать выжимку.
+Telegram bot that turns your X/Twitter feed into a clustered topic digest. Pulls your actual For You and Following timelines, groups posts by semantic similarity, and lets Claude name each cluster and write a short summary — so you read ten topics instead of scrolling 400 posts.
 
-## что умеет
+Built around one principle: **respect the user's real X feed**. The bot doesn't flood your timeline with topic-search results or re-rank by keyword heuristics. What's in the cluster list is what's in your actual feed, grouped and summarised.
 
-- **📊 что обсуждают** — снапшот For You за 12ч, сгруппирован в супер-категории → под-темы → посты. Листаешь стрелочками, лайкаешь, переводишь, читаешь топ-комменты.
-- **📰 моя лента** — то же самое, но источник Following за 24ч (вся лента подписок за вечер/ночь/утро).
-- **💬 хочу больше X** — свободный текст → Claude определяет кластеры, подбирает реальные X-аккаунты по теме, валидирует через X API и сразу тянет свежие посты по теме (с similarity-гейтом от мусора).
-- **👍 / 👎** — учат persistent preference-vector + понижают дизлайкнутые темы.
-- **dual-media** — если автор цитирует пост с медиа, бот шлёт 2 сообщения (автор + квота) и корректно удаляет оба при листании.
-- **/reset**, **⏸ пауза**, кастомный интервал доставки.
+---
 
-## архитектура
+## what it does
+
+- **📊 что обсуждают** — snapshot of your For You timeline over the last 20h, clustered into topics. Each topic comes with a Grok-Stories-style summary upfront (top 7 clusters pre-summarised in parallel).
+- **📰 моя лента** — same, but from your Following (chronological) timeline over 24h. Per-author cap keeps Reuters/Economist from dominating 75% of the digest.
+- **💬 хочу больше X** — free-form text → Claude picks real X handles for the topic, validates them against X (followers + existence), adds them to your tracked list, and immediately fetches their recent posts with a similarity gate so junk from topic-matching-but-unrelated accounts gets dropped.
+- **👍 / 👎** — updates a persistent preference vector and dampens disliked topics for the next 6 hours.
+- **dual-media** — when a post quotes another post that has media, the bot sends two Telegram messages (author + quote) and tracks both message IDs so `← Назад` cleans up both.
+- **/reset**, **⏸ pause**, custom delivery interval.
+
+---
+
+## pipeline
 
 ```
-telegram (aiogram) ──► handlers (report / feed / preferences / discussion / onboarding)
-                               │
-                               ▼
-                       core/report.build-report
-                          ├── x-parser.get-home-timeline / get-for-you-timeline
-                          ├── filters.is-low-signal (regex + hype + density)
-                          ├── embeddings.embed-batch (openai text-embedding-3-small)
-                          ├── cosine-union-find кластеризация (threshold 0.42)
-                          ├── ai-client.name-topic (claude haiku)
-                          ├── ai-client.group-super-topics
-                          └── ai-client.summarize-discussion (upfront, топ-7 тем)
-                               │
-                               ▼
-                       delivery.send-one-tweet (photo/video/animation/text + dual-media)
-                               │
-                               ▼
-                       sqlite (tweets, users, sent-news, feedback, followed-authors)
+telegram (aiogram)
+    │
+    ▼
+handlers (report / feed / preferences / discussion / onboarding)
+    │
+    ▼
+core/report.build_report
+    ├── x_parser.get_home_timeline / get_for_you_timeline  (paginated ~400 posts)
+    ├── bot-tracked author injection  (top 5 × 2 posts, freshest added)
+    ├── filters.is_low_signal         (ads, hype, info-density, list-dumps,
+    │                                  cross-platform promo, onlyfans)
+    ├── pending_boost_ids merge       (posts pre-fetched by «хочу больше X»,
+    │                                  capped at 20 per report)
+    ├── embeddings.embed_batch        (openai text-embedding-3-small)
+    ├── cosine union-find clustering  (0.42 threshold → name-merge at 0.62)
+    ├── ai_client.name_topic          (Claude Haiku, emoji + short name)
+    └── ai_client.summarize_discussion (upfront for top 7, lazy for the rest)
+    │
+    ▼
+delivery.send_one_tweet  (photo / video / animation / text + dual-media)
+    │
+    ▼
+sqlite (tweets, users, sent_news, feedback, followed_authors)
 ```
 
-## ключевые защиты от rate-limit
+---
 
-X очень быстро отдаёт 429 на read-endpoints при активном скрапинге. Внутри `core/x_parser.py`:
+## how ranking works
 
-- **`_X_API_SEM = asyncio.Semaphore(2)`** — один на процесс, ограничивает параллельные GraphQL запросы.
-- **`_USER_LOOKUP_CACHE`** — TTL 1ч для ok, 10м для 404/429. Один handle не бьётся повторно в том же build-report.
-- **`_SEARCH_COOLDOWN`** — 10м cooldown для query после 404/rate-limit.
-- **`_TWEETS_COOLDOWN`** — handle, у которого `get_user_tweets` упал на 429, пропускается.
-- **`_shorten_query`** в `ai-client` — обрезает Claude-queries до 3 слов (длинные запросы стабильно дают 404 от SearchTimeline).
+Clusters are ranked **by size, not by keyword match**. Formula inside `_cluster_and_name`:
 
-## стек
+```python
+weighted = (min(cluster_size, 12) + 5) * (1.0 + boost * boost_multiplier)
+```
+
+With `boost_multiplier=0` (current default), this collapses to pure size ranking — whatever's actually dominant in your X feed wins. The Claude-based interest scorer still exists in `ai_client.score_clusters_against_interests`, but it's a no-op unless you raise the multiplier in code.
+
+Why: a 12-post AI cluster from your real subscriptions should beat a 3-post fashion cluster just because you once typed "хочу больше моды". The user's X algorithm already knows what they want — we respect it.
+
+Dislike dampening is the main learning signal: 5+ dislikes of a named cluster within 6 hours excludes it from the next report.
+
+---
+
+## «хочу больше X» without flooding
+
+Typing `хочу больше про AI agents` does **not** trigger a 400-post X-search flood. Instead:
+
+1. Claude parses intent into 2-3 short English queries (`"ai agents"`, `"agent orchestration"`, `"claude tools"`) and proposes 4-8 real X handles.
+2. Handles are validated via `get_author_info` (must exist, ≥500 followers or verified) and added to `FollowedAuthor` with weight 2.0.
+3. `_immediate_topic_fetch` runs: search + recent posts from the handles, all gated by cosine similarity ≥ 0.25 to the query anchor. Typical yield: 20-50 relevant posts.
+4. Their IDs are stashed into `user.onboarding_payload["pending_boost_ids"]` — capped at 200.
+5. The next report pulls the top 20 of those pending IDs into the clustering pool. The rest of the pool is still the user's real X timeline.
+
+Result: the topic actually shows up in the next digest, but it doesn't bury AI/IT subscriptions that the user cares about.
+
+---
+
+## filters
+
+Universal, author-agnostic:
+
+- `too_short` / `hashtag_spam` / `all_caps` / `url_only` / `pure_retweet`
+- `ad_marker_en` / `ad_marker_ru` — sponsored / promo / airdrop / DYOR
+- `cross_platform_promo` — "links in bio", "join our telegram", `t.me/...`
+- `nsfw_body` / `nsfw_quote` — OnlyFans, NSFW, porn markers (including in quoted text)
+- `list_dump` — Reuters-style 5-line bulleted headline dumps
+- `hype:N.NN` — hype_score threshold (CAPS spam, emoji storms, "to the moon")
+- `low_density:N.NN` — info-density floor (no numbers, no URL, no names, short)
+
+No per-author blocklists in code. If you want to block a specific handle, the bot adds it to `user.blocked_authors` when you type "исключи @handle".
+
+---
+
+## rate-limit protection
+
+X hammers 429 on read endpoints under active scraping. `core/x_parser.py` has:
+
+- **`_X_API_SEM = asyncio.Semaphore(2)`** — one per process, caps concurrent GraphQL calls.
+- **`_USER_LOOKUP_CACHE`** — 1h TTL on OK, 10min on 404/429. Same handle isn't re-queried in one report.
+- **`_SEARCH_COOLDOWN`** — 10min cooldown on a query after 404/rate-limit.
+- **`_TWEETS_COOLDOWN`** — handles that 429 on `get_user_tweets` get skipped.
+- **`_shorten_query`** — Claude queries truncated to 3 words (longer phrases reliably 404 on SearchTimeline).
+- Pagination on `get_home_timeline` with early-abort on failure — up to 5 pages (~200-400 posts) instead of a single 100-post snapshot.
+
+---
+
+## stack
 
 - `python 3.12`
 - `aiogram 3.x` — telegram bot
-- `twikit` — X/Twitter GraphQL cookie-auth
-- `anthropic` SDK — Claude Haiku для naming/summarization, Sonnet для onboarding
-- `openai` SDK — embeddings (через ProxyAPI или напрямую)
+- `twikit` — X/Twitter GraphQL with cookie auth
+- `anthropic` SDK — Claude Haiku for naming / summarisation, Sonnet for onboarding
+- `openai` SDK — `text-embedding-3-small` (via ProxyAPI or direct)
 - `sqlalchemy 2.x + aiosqlite`
-- `apscheduler` — delivery-job каждые 20 мин, implicit-decay каждые 6ч
-- `chromadb` — вспомогательный vector store
+- `apscheduler` — delivery-job every 20 min, implicit-decay every 6h
+- `chromadb` — optional vector store
 
-## установка
+---
+
+## setup
 
 ```bash
-git clone <repo-url> x-news-bot
+git clone https://github.com/sakenuGOD/x-news-bot.git
 cd x-news-bot
 python -m venv venv
 venv/Scripts/activate          # windows
 # source venv/bin/activate     # linux/mac
 pip install -r requirements.txt
-cp .env.example .env           # заполни токены
+cp .env.example .env           # fill in tokens
 python -m bot.main
 ```
 
-## конфигурация (.env)
+### `.env`
 
 ```
 TELEGRAM_BOT_TOKEN=<from @BotFather>
@@ -77,79 +142,70 @@ OPENAI_BASE_URL=https://api.proxyapi.ru/openai/v1
 MODEL_HAIKU=claude-haiku-4-5
 MODEL_SONNET=claude-sonnet-4-5
 
-X_AUTH_TOKEN=<cookie auth_token из devtools>
-X_CT0=<опционально — cookie ct0>
+X_AUTH_TOKEN=<cookie auth_token from devtools>
+X_CT0=<optional — cookie ct0>
 
 DATABASE_URL=sqlite+aiosqlite:///./bot.db
 DEFAULT_DELIVERY_INTERVAL_HOURS=3
 ```
 
-auth_token берётся из браузерного сеанса X: DevTools → Application → Cookies → x.com → auth_token. Рекомендуется отдельный burner-аккаунт.
+`auth_token` comes from your browser X session: DevTools → Application → Cookies → x.com → `auth_token`. Use a burner account — the bot hits internal GraphQL endpoints.
 
-## структура
+---
+
+## structure
 
 ```
 x-news-bot/
 ├── bot/
 │   ├── main.py              # entrypoint — polling + scheduler
-│   ├── delivery.py          # send-one-tweet, dual-media, cleanup-post-by-message
-│   ├── keyboards.py         # inline клавиатуры
+│   ├── delivery.py          # send_one_tweet, dual-media, cleanup
+│   ├── keyboards.py         # inline keyboards
 │   └── handlers/
 │       ├── report.py        # «что обсуждают» / «моя лента»
-│       ├── feed.py          # 👍/👎/🇷🇺/💬 под постом
-│       ├── preferences.py   # «хочу больше X» — claude + immediate-fetch + similarity-гейт
-│       ├── discussion.py    # reply-ответы на пост через claude
-│       └── onboarding.py    # /start — первичная настройка
+│       ├── feed.py          # 👍 / 👎 / 🇷🇺 / 💬 under a post
+│       ├── preferences.py   # «хочу больше X» — Claude + immediate fetch + similarity gate
+│       ├── discussion.py    # reply-to-post via Claude
+│       └── onboarding.py    # /start
 ├── core/
-│   ├── x_parser.py          # twikit + ttl-кэш + семафор + cooldown
-│   ├── ai_client.py         # все вызовы claude (pydantic-схемы)
-│   ├── embeddings.py        # openai embeddings + nearest-cluster
-│   ├── filters.py           # is-low-signal (trash/hype/density/list-dump)
-│   ├── report.py            # build-report: fetch → filter → embed → cluster → name → summary
-│   ├── recommender.py       # score-tweet, pick-top-for-user
-│   └── demo_data.py         # демо-пул для fallback
+│   ├── x_parser.py          # twikit + TTL cache + semaphore + cooldowns + pagination
+│   ├── ai_client.py         # all Claude calls (pydantic schemas)
+│   ├── embeddings.py        # openai embeddings + nearest_cluster
+│   ├── filters.py           # is_low_signal (trash / hype / density / promo / nsfw)
+│   ├── report.py            # build_report: fetch → filter → embed → cluster → name → summary
+│   ├── recommender.py       # score_tweet, pick_top_for_user
+│   └── demo_data.py         # demo pool fallback
 ├── db/
-│   ├── database.py          # async engine + in-place миграции
-│   ├── models.py            # user, tweet, feedback, sent-news, followed-author
+│   ├── database.py          # async engine + in-place migrations
+│   ├── models.py            # user, tweet, feedback, sent_news, followed_author
 │   └── vector_store.py      # chroma
 ├── scheduler.py             # delivery-job + implicit-decay-job
 ├── config.py                # settings (env)
 └── requirements.txt
 ```
 
-## как работает ранжирование
+---
 
-```
-score(tweet, user) =
-    0.40 * relevance       # cosine(tweet.embedding, user.preference-vector)
-  + 0.15 * cluster-boost   # взвешенная сумма cosine к якорям кластеров
-  + 0.25 * trust           # source-trust-score (followers + age + verified)
-  + 0.20 * freshness       # exp(-hours-old / 12)
-  - 0.15 * diversity-pen   # похожесть на уже выбранные в батче
-  + author-bonus           # (followed-author.weight - 1) * 0.25
-```
+## what's cached
 
-- **дизлайк** — главный сигнал обучения: `update-on-dislike` двигает preference-vector ОТ твита.
-- **implicit-skip** — если пост показан 12ч назад и нет клика → слабый негативный сигнал.
-- **exploration-ratio 0.20** — 1 из 5 слотов под разведку менее очевидных кандидатов.
-- **«хочу больше X»** — Claude boost/suppress кластеров + immediate-fetch по query + автоматическое подключение релевантных X-аккаунтов с weight=2.0.
+- `tweet.embedding` — forever (1536-float JSON)
+- `tweet.summary_ru` — lazy ru translation, cached in DB
+- `cluster.summary` — upfront (top 7) + lazy (on topic open)
+- `Report` — in-memory per-user
+- `x_parser._USER_LOOKUP_CACHE` — 1h TTL
+- `x_parser._SEARCH_COOLDOWN` / `_TWEETS_COOLDOWN` — 10min on failed endpoints
 
-## что кэшируется
-
-- `tweet.embedding` — навсегда (1536-float JSON), пересчитывать дорого
-- `tweet.summary-ru` — ленивый перевод на русский, кэшируется в БД
-- `cluster.summary` — upfront (топ-7) + lazy (при открытии темы)
-- `Report` — в памяти процесса, per-user
-- `x-parser._USER_LOOKUP_CACHE` — TTL 1ч
-- `x-parser._SEARCH_COOLDOWN` / `_TWEETS_COOLDOWN` — 10м на failed endpoints
+---
 
 ## troubleshooting
 
-- **429 в логах снова и снова** — cookies X устарели, обнови `X_AUTH_TOKEN`. Cooldown в коде предотвращает death-loop, но не вернёт данные без живой auth.
-- **бот висит на «⏳ смотрю что обсуждают»** — X rate-limit на For You. Подожди 15 мин или используй «моя лента» (Following менее лимитирован).
-- **пустые темы «разное · 3 поста»** — лента спокойная в это время суток. Попробуй через час или расширь окно в `report.py`.
-- **миграция SQLite** — колонки добавляются через `ALTER TABLE` в `db/database.py:init-db`. Ошибки «column already exists» игнорируются (idempotent).
+- **429 flooding the logs** — X cookies expired, refresh `X_AUTH_TOKEN`. Cooldowns prevent a death-loop but won't recover without live auth.
+- **«⏳ смотрю что обсуждают» hangs** — rate-limited on For You. Wait 15min or use «моя лента» (Following is less restricted).
+- **"разное · 3 поста"** — timeline is quiet right now, or filters are too tight for this hour. Try again in an hour, or widen `window_hours` in `bot/handlers/report.py`.
+- **SQLite migration errors** — columns are added via `ALTER TABLE` in `db/database.py:init_db`. "column already exists" is idempotent-ignored.
 
-## лицензия
+---
+
+## license
 
 mit
