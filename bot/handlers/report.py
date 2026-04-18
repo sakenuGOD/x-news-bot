@@ -74,14 +74,28 @@ def _overview_kb_meta(report: Report) -> list[tuple[int, str, str, int]]:
 
 async def _render_report(message: Message, report: Report, *, digest: bool = False,
                          force_flat: bool = False) -> None:
-    """Отправляет готовый отчёт — всегда плоский список тем.
+    """Отправляет готовый отчёт.
 
-    Super-topics отключены: Claude склеивал «Bitcoin + XRP + Jensen Huang» в
-    «IT/Технологии» и юзер видел абстрактные ярлыки вместо реальных тем.
-    Плоский список показывает honestly что в ленте.
+    Если в отчёте есть super_topics (≥6 sub-cluster'ов и Claude их сгруппировал)
+    и force_flat=False — показываем супер-категории (клик → под-темы).
+    Иначе — плоский список всех тем. Переключение «Все темы списком» есть
+    в super_topics_kb, так что юзер всегда может развернуть.
     """
     text = _format_overview_text(report, digest=digest)
-    kb = report_overview_kb(_overview_kb_meta(report))
+    if report.super_topics and not force_flat:
+        by_id = {c.id: c for c in report.clusters}
+        super_meta: list[tuple[int, str, str, int]] = []
+        for sidx, st in enumerate(report.super_topics):
+            total = sum(len(by_id[cid].tweet_ids) for cid in st.sub_ids if cid in by_id)
+            if total == 0:
+                continue
+            super_meta.append((sidx, st.emoji, st.name, total))
+        if super_meta:
+            kb = super_topics_kb(super_meta)
+        else:
+            kb = report_overview_kb(_overview_kb_meta(report))
+    else:
+        kb = report_overview_kb(_overview_kb_meta(report))
     await message.answer(
         text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True,
     )

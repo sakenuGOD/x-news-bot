@@ -683,11 +683,29 @@ async def build_report(
         )
         log.info("adaptive retry with min_cluster_size=2: got %d topics", len(clusters))
 
-    # ---------- 6a. Super-topic grouping ОТКЛЮЧЕНО ----------
-    # Claude группировал «Bitcoin + XRP + Jensen Huang» в «IT/Технологии» —
-    # юзер видел абстрактные ярлыки и думал что бот пропустил его реальные
-    # темы. Показываем плоский список (реальные имена кластеров).
+    # ---------- 6a. Super-topic grouping ----------
+    # Группируем только при ≥6 темах — иначе плоский список читается лучше
+    # чем 2 супер-категории с 2-3 подтемами. Prompt ai_client явно
+    # разводит Крипта vs IT vs Бизнес/Финансы (юзер жаловался: Bitcoin
+    # залетал в «IT»). Одиночные супер-категории ai_client скидывает в
+    # «Разное», так что overview не захламляется группами из 1 темы.
     super_topics: list[SuperTopic] = []
+    if len(clusters) >= 6:
+        try:
+            await _notify("🗂 Группирую темы в категории…")
+            subtopic_meta = [(c.id, c.emoji, c.name) for c in clusters]
+            super_raw = await ai_client.group_super_topics(subtopic_meta)
+            for item in super_raw or []:
+                super_topics.append(SuperTopic(
+                    emoji=item.get("emoji") or "📌",
+                    name=item.get("name") or "Разное",
+                    sub_ids=list(item.get("sub_ids") or []),
+                ))
+            log.info("super-topic grouping: %d supers from %d clusters",
+                     len(super_topics), len(clusters))
+        except Exception as e:
+            log.debug("super-topic grouping failed (non-fatal): %s", e)
+            super_topics = []
 
     # ---------- 6b. Upfront summaries (digest mode) ----------
     # Сразу саммаризуем топ-N кластеров параллельно, чтобы overview показывал не
