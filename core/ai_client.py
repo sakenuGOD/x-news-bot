@@ -60,6 +60,14 @@ class PreferenceRequestResult(BaseModel):
     # Авторы которых юзер явно попросил больше не показывать
     # («исключи Reuters», «без Илона Маска»). Юзернеймы без @.
     blocked_accounts: list[str] = Field(default_factory=list)
+    # Развёрнутое описание намерения юзера на английском (для embedding-anchor).
+    # «хочу больше моды» → «editorial fashion coverage: Met Gala red carpet,
+    # runway reviews, street style photography, menswear commentary. Avoid
+    # shopping promos, affiliate try-on hauls, meme-joke fashion posts».
+    # Используется как positive/negative anchor для similarity-gate при
+    # immediate-fetch и для фильтра в report pipeline.
+    intent_positive: str = Field(default="")
+    intent_negative: str = Field(default="")
 
 
 class AntifakeResult(BaseModel):
@@ -256,44 +264,57 @@ async def process_preference_request(
         return fallback
 
     system = (
-        "Ты обрабатываешь запрос пользователя на корректировку новостной ленты. "
-        "Определяешь какие тематические кластеры усилить/ослабить, формируешь "
-        "КОНКРЕТНЫЕ поисковые запросы на английском для X-search и предлагаешь "
-        "РЕАЛЬНЫЕ X-аккаунты которые стоит отслеживать по этой теме — исходя "
-        "из своих знаний о профессиональных издательствах, авторах и комьюнити "
-        "в X. Не выдумывай аккаунты, которых нет; не путай с Instagram/TikTok. "
-        "Только username (без @), которые ты точно знаешь что существуют в X/Twitter.\n\n"
+        "Ты помогаешь настроить персональную новостную ленту пользователя. "
+        "Твоя задача — ГЛУБОКО понять что именно юзер имел в виду под своей фразой, "
+        "и превратить это в структурированные сигналы для ранжирования.\n\n"
+        "Ключевой принцип: интерпретируй намерение, а не буквальные слова. "
+        "«хочу больше моды» может значить editorial fashion (Met Gala, runway "
+        "reviews, street style), а может — retail shopping — но это РАЗНЫЕ вещи, "
+        "и тот же текст поста попадает в разные категории. Пиши intent_positive "
+        "и intent_negative так, чтобы они работали как embedding-anchor: "
+        "развёрнутое описание 2-4 предложений на английском с примерами того "
+        "что включается и что исключается.\n\n"
         "КРИТИЧНО про search_queries:\n"
         "- МАКСИМУМ 3 слова в запросе. X SearchTimeline падает с 404 на длинных queries.\n"
         "- Без года, кавычек, операторов (OR/AND).\n"
         "- Конкретные термы: «japanese streetwear», не «fashion». "
         "«claude code», не «AI tools».\n"
-        "- Если юзер просит несколько ракурсов темы — 3-4 отдельных коротких запроса.\n\n"
+        "- Если намерение многогранное — 3-5 отдельных коротких запросов, "
+        "каждый под свой аспект.\n\n"
+        "Про suggested_accounts: РЕАЛЬНЫЕ X-аккаунты (без @) которые публикуют "
+        "по теме — из своих знаний о профессиональных изданиях, авторах, "
+        "комьюнити. Не выдумывай, не путай с Instagram/TikTok.\n\n"
+        "Про boost/suppress: это слоты для весов тематики. Выбирай из списка "
+        "ниже только если тема РЕАЛЬНО попадает в слот. Если запрос уникален и "
+        "ни один слот не подходит идеально — оставь boost пустым и положись на "
+        "intent_positive + search_queries + suggested_accounts, этого хватит "
+        "для ранжирования. Не натягивай.\n\n"
         "Отвечаешь ТОЛЬКО JSON."
     )
     user = (
-        f"Доступные кластеры: {_CLUSTER_NAMES_STR}\n\n"
+        f"Слоты весов (необязательные, только если реально попадает): {_CLUSTER_NAMES_STR}\n\n"
         f"Текущие веса: {json.dumps(current_weights, ensure_ascii=False)}\n\n"
         f"Запрос пользователя: «{text}»\n\n"
         "Верни JSON:\n"
         "{\n"
-        '  "boost": ["<cluster>", ...],    // кластеры из списка выше, соответствующие теме\n'
-        '  "suppress": ["<cluster>", ...], // кластеры ослабить\n'
+        '  "intent_positive": "English 2-4 sentences describing EXACTLY what content the user wants. Give concrete examples of subjects, angles, post styles that qualify. Be vivid — this string is used as an embedding anchor for similarity ranking.",\n'
+        '  "intent_negative": "English 2-4 sentences describing what content from the same general topic the user does NOT want. Concrete counter-examples. Used as negative anchor to push out off-target posts.",\n'
+        '  "boost": ["<slot>", ...],\n'
+        '  "suppress": ["<slot>", ...],\n'
         '  "reply": "короткий ответ пользователю на русском — что именно учтено",\n'
-        '  "search_queries": ["2-3 слова", "2-3 слова", "2-3 слова"],\n'
-        "  // РОВНО 2-3 слова на запрос, строго! Примеры для «японский стиль одежды»:\n"
-        "  //   [\"japanese streetwear\", \"harajuku style\", \"tokyo fashion\"]\n"
-        "  //   НЕ «Paris Fashion Week 2025 haute couture collections» — это 404.\n"
-        '  "suggested_accounts": ["user1", "user2", "user3", "user4"],\n'
-        "  // 4-8 РЕАЛЬНЫХ X-username (без @) которые публикуют по этой теме.\n"
-        "  // Предпочитай издания/редакции и известных авторов, не рандомных блогеров.\n"
-        "  // Для «японский стиль одежды»: «highsnobiety», «hypebeastjp», «voguejapan»,\n"
-        "  // «fashionsnap» и т.п.\n"
+        '  "search_queries": ["2-3 слова", ...],\n'
+        '  "suggested_accounts": ["user1", "user2", ...],\n'
         '  "blocked_accounts": ["username1", ...]\n'
-        "  // Если юзер явно попросил убрать/исключить конкретные аккаунты — список\n"
-        "  // их юзернеймов без @ (например юзер пишет «исключи Reuters» → [\"Reuters\"]).\n"
-        "  // Иначе пустой массив.\n"
-        "}"
+        "}\n\n"
+        "Пример для запроса «хочу больше моды как одеваются обычные парни»:\n"
+        '  "intent_positive": "Editorial menswear and everyday-style coverage: '
+        'candid street style photography, Met Gala and runway show reviews, '
+        'GQ/Esquire-style menswear commentary analysing silhouettes, fit breakdowns '
+        'and designer drops from working fashion writers and stylists.",\n'
+        '  "intent_negative": "Retail affiliate content like \\"save this for outfit '
+        'inspo\\", influencer try-on hauls with shop-now links, meme jokes poking '
+        'fun at a passing trend with short video, brand promo posts announcing new '
+        'arrivals or percent-off deals."'
     )
     try:
         reply = await _call_claude(settings.model_sonnet, system, user, max_tokens=600, temperature=0.3)
@@ -550,48 +571,54 @@ async def discuss_post(post_text: str, author: str, user_question: str) -> str:
 
 
 async def group_super_topics(
-    subtopics: list[tuple[int, str, str]],  # [(id, emoji, name), ...]
+    subtopics: list[tuple[int, str, str, int]],  # [(id, emoji, name, post_count), ...]
 ) -> list[dict]:
-    """Группирует мелкие кластеры в 3-5 широких супер-категорий.
+    """Группирует мелкие кластеры в широкие супер-категории.
 
     Вход: список sub-topics (Claude Design релиз, Building Effective Agents,
     японский стиль, streetwear Tokyo, Reuters sports, FISA расширение).
-    Выход: `[{"emoji": "💻", "name": "IT", "sub_ids": [0, 2, 5]}, ...]`.
+    Выход: `[{"emoji": "💻", "name": "Технологии", "sub_ids": [0, 2, 5]}, ...]`.
 
-    Пустой список = нечего группировать (оставляем плоский список).
+    Названия супер-категорий НЕ захардкожены — Claude придумывает их сам
+    исходя из того что в под-темах. Если юзер читает про F1/watches/cooking —
+    появятся «Гонки», «Часы», «Кулинария». Список фиксированных ярлыков
+    ломает эту гибкость.
     """
     if not subtopics:
         return []
-    pairs = "\n".join(f"  {sid}. {emoji} {name}" for sid, emoji, name in subtopics)
+    pairs = "\n".join(
+        f"  {sid}. {emoji} {name} · {cnt} постов"
+        for sid, emoji, name, cnt in subtopics
+    )
     system = (
-        "Ты группируешь мелкие темы дня в 3-6 СУПЕР-категорий для меню "
-        "новостного бота. Каждая под-тема попадает РОВНО в одну супер-категорию. "
-        "Супер-категория должна содержать МИНИМУМ 2 под-темы — одиночные "
-        "перекидывай в «Разное», не форси.\n\n"
-        "Важные разделения (юзер жаловался на смешивание):\n"
-        "• IT/Технологии — чистый софт, AI-модели, разработка, железо "
-        "(Claude/GPT, чипы NVIDIA, релизы инструментов, open source).\n"
-        "• Крипта — Bitcoin, Ethereum, альткоины, DeFi, blockchain. "
-        "НИКОГДА не объединяй с IT.\n"
-        "• Бизнес/Финансы — акции (TSLA/AAPL/NVDA stocks, не чипы), earnings, "
-        "рынок труда, сделки компаний. Торговые позиции по BTC — это Крипта, "
-        "не Бизнес.\n"
-        "• Политика — выборы, геополитика, переговоры, санкции.\n"
-        "• Наука — исследования, физика, биология, космос, медицина.\n"
-        "• Мода/Стиль — одежда, коллекции, показы, стиль, тренды ношения.\n"
-        "• Культура — музыка, кино, книги, искусство, шоу.\n"
-        "• Спорт — матчи, турниры, трансферы.\n"
-        "• Разное — всё что не клеится логично.\n\n"
-        "Если под-темы слабо связаны между собой — лучше отдельная супер-категория "
-        "с одной под-темой НЕ создаётся, скидывай в «Разное». Отвечай ТОЛЬКО JSON."
+        "Ты группируешь мелкие темы дня в широкие супер-категории для навигации "
+        "по новостному боту. Названия супер-категорий ПРИДУМЫВАЙ САМ из смысла "
+        "под-тем — не используй шаблонный список, не натягивай под-темы на "
+        "заранее заданные ярлыки.\n\n"
+        "Правила группировки:\n"
+        "1. Каждая под-тема попадает РОВНО в одну супер-категорию.\n"
+        "2. Группируй по аудитории: «что за читатель придёт сюда кликнуть?». "
+        "Если одна и та же аудитория не читает две темы одновременно — не "
+        "сливай их. Типичные разъезды: торговля финансовыми активами "
+        "(крипто, акции, сырьё) ≠ создание технологий (софт, железо, "
+        "исследования) ≠ бизнес-сделки и макро ≠ стиль одежды ≠ культура "
+        "(музыка/кино) ≠ спорт ≠ политика ≠ наука. Одна категория = одна "
+        "аудитория.\n"
+        "3. Супер-категория с 2+ под-темами — нормальный кейс. Супер-категория "
+        "с 1 под-темой разрешена ТОЛЬКО если в этой под-теме ≥5 постов "
+        "(важная самостоятельная тема дня). Мелкие одиночки (<5 постов) "
+        "скидывай в «Прочее».\n"
+        "4. Название супер-категории — 1-3 слова на русском, эмодзи 1 символ. "
+        "Пиши конкретно: «Технологии», «Крипто-трейдинг», «Мода», «Большая "
+        "политика», «Мировой спорт» — а не общее «Новости».\n\n"
+        "Отвечай ТОЛЬКО JSON."
     )
     user_msg = (
         f"Под-темы:\n{pairs}\n\n"
         "Верни JSON:\n"
         "{\n"
         '  "super_topics": [\n'
-        '    {"emoji": "💻", "name": "IT/Технологии", "sub_ids": [0, 2, 5]},\n'
-        '    {"emoji": "🪙", "name": "Крипта", "sub_ids": [3, 4]},\n'
+        '    {"emoji": "<1 символ>", "name": "<1-3 слова>", "sub_ids": [<int>, ...]},\n'
         "    ...\n"
         "  ]\n"
         "}"
@@ -605,7 +632,7 @@ async def group_super_topics(
         st = data["super_topics"]
         if not isinstance(st, list):
             return []
-        valid_ids = {sid for sid, _, _ in subtopics}
+        valid_ids = {sid for sid, _, _, _ in subtopics}
         out = []
         seen_ids: set[int] = set()
         for item in st:
@@ -625,30 +652,38 @@ async def group_super_topics(
                     continue
             if clean_ids:
                 out.append({"emoji": emoji, "name": name, "sub_ids": clean_ids})
-        # Фильтр «одиночных» супер-категорий: кроме «Разное», удаляем
-        # супер-категории с 1 под-темой — они бесполезны (клик по категории
-        # открывает 1 тему, проще показать тему сразу плоско). Одиночек
-        # перебрасываем в «Разное».
+        # Singleton super-категории разрешены если в единственной под-теме
+        # ≥5 постов — это самостоятельная крупная тема дня (напр. «Мода»
+        # когда у юзера 8 постов про стиль, а остальные кластеры смешанные).
+        # Мелкие одиночки (<5 постов) скидываем в «Прочее».
+        subtopic_counts = {sid: cnt for sid, _, _, cnt in subtopics}
         misc_ids: list[int] = []
         filtered_out: list[dict] = []
         for item in out:
-            if len(item["sub_ids"]) >= 2 or item["name"] == "Разное":
+            if len(item["sub_ids"]) >= 2:
+                filtered_out.append(item)
+                continue
+            lone_id = item["sub_ids"][0]
+            if subtopic_counts.get(lone_id, 0) >= 5:
                 filtered_out.append(item)
             else:
-                misc_ids.extend(item["sub_ids"])
+                misc_ids.append(lone_id)
         out = filtered_out
-        # Неучтённые под-темы — тоже в «Разное».
+        # Неучтённые под-темы — тоже в «Прочее».
         leftover = [sid for sid in valid_ids if sid not in seen_ids]
         misc_ids.extend(leftover)
         if misc_ids:
-            # Если «Разное» уже есть — дополняем, иначе создаём.
-            misc_existing = next((it for it in out if it["name"] == "Разное"), None)
+            # Если «Прочее» уже есть — дополняем, иначе создаём.
+            misc_existing = next(
+                (it for it in out if it["name"].lower() in ("разное", "прочее")),
+                None,
+            )
             if misc_existing:
                 for mid in misc_ids:
                     if mid not in misc_existing["sub_ids"]:
                         misc_existing["sub_ids"].append(mid)
             else:
-                out.append({"emoji": "📌", "name": "Разное", "sub_ids": misc_ids})
+                out.append({"emoji": "📌", "name": "Прочее", "sub_ids": misc_ids})
         return out
     except Exception as e:
         log.warning("group_super_topics failed: %s", e)

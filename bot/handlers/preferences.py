@@ -47,31 +47,6 @@ async def apply_preference_text(message: Message, text: str) -> None:
     from sqlalchemy import select
     import re as _re
 
-    # Эвристический маппинг нестандартных запросов на кластеры. Claude иногда
-    # не может сопоставить «японский стиль одежды» → lifestyle и возвращает
-    # пустой boost. Этот словарь подхватывает такие случаи детерминированно,
-    # плюс генерирует поисковый запрос на инглише для X search.
-    # Эвристика — ТОЛЬКО на случай если Claude полностью обнулился. Ключевое:
-    # word-boundary там где нужно, чтобы «япон**ии**» не триггерил AI-матч.
-    _HEURISTIC = [
-        # (regex lower, cluster, fallback_search_query)
-        (r"(япон|\bjapan\b|tokyo|токио|harajuku|uniqlo)", "lifestyle", "japanese fashion"),
-        (r"(корей|\bkorean\b|k-?pop|k-?beauty|сеул)", "culture", "korean style"),
-        (r"(мод[ау]|\bfashion\b|одежд|outfit|streetwear)", "lifestyle", "fashion trends"),
-        (r"(бренд|luxury|gucci|prada|hermes|vuitton)", "lifestyle", "luxury fashion"),
-        (r"(beaut|красот|skincare|уход за кож)", "lifestyle", "skincare beauty"),
-        # AI — только ПОЛНЫЕ слова («ии» как отдельное слово, не внутри «япон-ии»).
-        (r"(\bai\b|\bии\b|\bllm\b|claude|gpt|anthropic|agent\b)", "ai", "AI agents"),
-        (r"(startup|стартап|founder|vc)", "business", "startup funding"),
-        (r"(crypto|крипт|bitcoin|eth|defi)", "crypto", "crypto market"),
-        (r"(\bspace\b|nasa|космос|starship)", "science", "space discovery"),
-        (r"(\bgame\b|игр[ыау]|gaming|playstation|xbox|nintendo)", "gaming", "game release"),
-        (r"(football|футбол|basketball|nba|nfl|soccer)", "sports", "sports highlight"),
-        (r"(music|музык|spotify|album|rap|hip-?hop)", "culture", "music release"),
-        (r"(film|movi|фильм|series|сериал)", "culture", "film release"),
-        (r"(politic|политик|election|trump|biden)", "politics", "politics breaking"),
-    ]
-
     # Паттерн «убери/исключи @handle» — РАНЬШЕ вызова Claude.
     # Если юзер просит убрать конкретный аккаунт — НЕ гоним suppress по кластеру
     # (раньше «убери @Reuters» давало suppress=news и лента новостей становилась
@@ -106,22 +81,7 @@ async def apply_preference_text(message: Message, text: str) -> None:
                 log.info("pure block request — discarding Claude suppress=%s", result.suppress)
             result.suppress = []
 
-        lower_text = text.lower()
         claude_queries_raw = list(getattr(result, "search_queries", []) or [])
-        if not result.boost and not result.suppress and not is_pure_block_request:
-            for pat, cluster, q in _HEURISTIC:
-                if _re.search(pat, lower_text):
-                    if cluster not in result.boost:
-                        result.boost.append(cluster)
-                    if q not in claude_queries_raw:
-                        claude_queries_raw.append(q)
-            if result.boost:
-                # Перепишем reply — что реально сделали.
-                result.reply = (
-                    f"Понял: тема «{text.strip()[:60]}». "
-                    f"Усилил кластеры: {', '.join(result.boost)}. "
-                    f"Буду искать: {', '.join(claude_queries_raw) or '—'}."
-                )
 
         # Сильнее сдвигаем веса: «хочу больше про X» должно реально затоплять
         # ленту этой темой, а не робко добавлять 1 пост на 100. +0.45 за раз,
@@ -165,8 +125,8 @@ async def apply_preference_text(message: Message, text: str) -> None:
         if text.strip() and not claude_queries_raw and not is_pure_block_request:
             claude_queries_raw.append(text.strip()[:80])
 
+        payload = dict(user.onboarding_payload or {})
         if claude_queries_raw:
-            payload = dict(user.onboarding_payload or {})
             saved = list(payload.get("saved_search_queries") or [])
             for q in claude_queries_raw:
                 if isinstance(q, str) and q.strip() and q not in saved:
@@ -177,7 +137,24 @@ async def apply_preference_text(message: Message, text: str) -> None:
             # диверсификации, без конфликтующих призраков.
             saved = saved[-5:]
             payload["saved_search_queries"] = saved
-            user.onboarding_payload = payload
+
+        # Сохраняем intent-anchor'ы (Claude-развёрнутая интерпретация фразы)
+        # для будущего фильтра. Храним последние 3 — чтобы интерпретации от
+        # «хочу больше про моду» и «меньше политики» работали одновременно,
+        # но при смене интересов старые не зависали навсегда.
+        intent_pos = (getattr(result, "intent_positive", "") or "").strip()
+        intent_neg = (getattr(result, "intent_negative", "") or "").strip()
+        if intent_pos or intent_neg:
+            intents = list(payload.get("intent_anchors") or [])
+            intents.append({
+                "raw": text.strip()[:160],
+                "positive": intent_pos,
+                "negative": intent_neg,
+            })
+            intents = intents[-3:]
+            payload["intent_anchors"] = intents
+
+        user.onboarding_payload = payload
 
         paused = bool(user.paused)
         user_id = user.telegram_id
@@ -273,6 +250,8 @@ async def apply_preference_text(message: Message, text: str) -> None:
             fetched_new = await _immediate_topic_fetch(
                 user_id, claude_queries_raw, added_accounts,
                 raw_user_text=text,
+                intent_positive=getattr(result, "intent_positive", "") or "",
+                intent_negative=getattr(result, "intent_negative", "") or "",
             )
         except Exception as e:
             log.warning("immediate fetch for user=%s failed: %s", user_id, e)
@@ -310,6 +289,8 @@ async def _immediate_topic_fetch(
     added_account_strings: list[str],
     *,
     raw_user_text: str = "",
+    intent_positive: str = "",
+    intent_negative: str = "",
 ) -> int:
     """Сразу после «хочу больше X» — тянем из X посты по запросам и от новых
     каналов, сохраняем с embedding. Возвращаем сколько новых твитов добавили.
@@ -395,44 +376,60 @@ async def _immediate_topic_fetch(
                  user_id, len(all_raw), queries)
         return 0
 
-    # Embedding + topic similarity guard.
-    # Эталон темы = сырой текст юзера + Claude-queries. Сырой текст даёт
-    # более богатый вектор (несколько слов + контекст), чем 3-словные queries
-    # поодиночке. Иначе короткие queries дают слабый anchor и валидный fashion-
-    # контент отсеивается (в логах видел low_sim_drop=37 из 51).
-    anchor_parts: list[str] = []
-    if raw_user_text:
-        anchor_parts.append(raw_user_text)
-    anchor_parts.extend([q for q in (queries or []) if q])
-    topic_anchor_text = " ".join(anchor_parts).strip()
-    topic_anchor_emb: Optional[list[float]] = None
-    if topic_anchor_text:
-        anchor_embs = await emb.embed_batch([topic_anchor_text])
-        if anchor_embs and anchor_embs[0]:
-            topic_anchor_emb = anchor_embs[0]
+    # Embedding + intent-based gate. Вместо одного anchor-а (raw_user_text
+    # + queries) используем ДВА — positive и negative — из Claude-интерпретации
+    # фразы юзера. Принимаем пост если sim(pos) > sim(neg) + 0.03 И sim(pos) >=
+    # 0.22. Это позволяет «хочу больше моды, имею в виду Met Gala» реально
+    # отсекать «save this for outfit inspo» (близко к negative про shopping),
+    # сохраняя editorial posts (близко к positive про runway/street style).
+    pos_text = intent_positive.strip()
+    if not pos_text:
+        # Фолбэк: если Claude не дал развёрнутый intent — собираем эталон из
+        # raw text + queries как раньше.
+        parts = [raw_user_text] + [q for q in (queries or []) if q]
+        pos_text = " ".join(p for p in parts if p).strip()
+    neg_text = intent_negative.strip()
+
+    anchor_texts = [t for t in (pos_text, neg_text) if t]
+    anchor_embs: list[Optional[list[float]]] = [None, None]
+    if anchor_texts:
+        computed = await emb.embed_batch(anchor_texts)
+        idx = 0
+        if pos_text:
+            anchor_embs[0] = computed[idx]
+            idx += 1
+        if neg_text:
+            anchor_embs[1] = computed[idx]
+
+    pos_emb, neg_emb = anchor_embs
 
     texts = [t.text for t in clean]
     embs = await emb.embed_batch(texts)
     pairs_raw = [(rt, e) for rt, e in zip(clean, embs) if e]
 
-    # Similarity-гейт. Было 0.18 — пропускал «hairy guy video», quote-tweet с
-    # NSFW, и spam-посты про одежду от farm-аккаунтов. Поднимаем порог до 0.25
-    # — это всё ещё пропускает ассоциированный контент (streetwear → fashion
-    # news), но режет явные off-topic с единственным совпадающим словом
-    # («clothes» в NSFW-цитате).
     pairs: list[tuple] = []
     filtered_low_sim = 0
-    if topic_anchor_emb and pairs_raw:
-        scored = [(rt, e, emb.cosine_similarity(e, topic_anchor_emb)) for rt, e in pairs_raw]
-        scored.sort(key=lambda x: x[2], reverse=True)
-        hard_cutoff = 0.25
-        for rt, e, sim in scored:
-            if sim < hard_cutoff:
+    filtered_neg_dominant = 0
+    if pos_emb and pairs_raw:
+        for rt, e in pairs_raw:
+            sim_pos = emb.cosine_similarity(e, pos_emb)
+            if sim_pos < 0.22:
                 filtered_low_sim += 1
                 continue
+            if neg_emb:
+                sim_neg = emb.cosine_similarity(e, neg_emb)
+                # Если пост семантически ближе к «что НЕ хочу» чем к «что хочу»
+                # с запасом 0.03 — отбрасываем. Покрывает кейс Gini London
+                # («save for outfit inspo» ближе к shopping, чем к editorial).
+                if sim_neg > sim_pos + 0.03:
+                    filtered_neg_dominant += 1
+                    continue
             pairs.append((rt, e))
     else:
         pairs = pairs_raw
+    if filtered_neg_dominant:
+        log.info("immediate-fetch user=%s: %d dropped by intent-negative anchor",
+                 user_id, filtered_neg_dominant)
 
     if not pairs:
         log.info("immediate fetch user=%s: 0 after similarity filter (raw=%d, low_sim=%d)",

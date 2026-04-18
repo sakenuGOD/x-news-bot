@@ -684,21 +684,24 @@ async def build_report(
         log.info("adaptive retry with min_cluster_size=2: got %d topics", len(clusters))
 
     # ---------- 6a. Super-topic grouping ----------
-    # Группируем только при ≥6 темах — иначе плоский список читается лучше
-    # чем 2 супер-категории с 2-3 подтемами. Prompt ai_client явно
-    # разводит Крипта vs IT vs Бизнес/Финансы (юзер жаловался: Bitcoin
-    # залетал в «IT»). Одиночные супер-категории ai_client скидывает в
-    # «Разное», так что overview не захламляется группами из 1 темы.
+    # Группируем при ≥5 темах — при меньшем числе плоский список читается
+    # лучше чем супер-категории. Prompt ai_client НЕ предписывает список
+    # категорий — Claude придумывает имена сам из под-тем, так что
+    # «Часы», «F1», «Кулинария» появятся если в ленте такие темы есть.
+    # Singleton супер-категории разрешены при ≥5 постах (ai_client сам
+    # фильтрует), мелкие одиночки уходят в «Прочее».
     super_topics: list[SuperTopic] = []
-    if len(clusters) >= 6:
+    if len(clusters) >= 5:
         try:
             await _notify("🗂 Группирую темы в категории…")
-            subtopic_meta = [(c.id, c.emoji, c.name) for c in clusters]
+            subtopic_meta = [
+                (c.id, c.emoji, c.name, len(c.tweet_ids)) for c in clusters
+            ]
             super_raw = await ai_client.group_super_topics(subtopic_meta)
             for item in super_raw or []:
                 super_topics.append(SuperTopic(
                     emoji=item.get("emoji") or "📌",
-                    name=item.get("name") or "Разное",
+                    name=item.get("name") or "Прочее",
                     sub_ids=list(item.get("sub_ids") or []),
                 ))
             log.info("super-topic grouping: %d supers from %d clusters",

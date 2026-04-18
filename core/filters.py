@@ -70,8 +70,17 @@ def is_trash(tweet: RawTweet) -> tuple[bool, str]:
     text = tweet.text or ""
     text_lower = text.lower()
 
-    # Длина в словах (после удаления ссылок и @mentions).
-    cleaned = re.sub(r"https?://\S+|@\w+", "", text).strip()
+    # Длина в словах. ВАЖНО: если в посте есть quote (↪ цитирует / ▌ @),
+    # считаем только АВТОРСКУЮ часть — до quote-маркера. Иначе «Fashion
+    # trends evolve rapidly. ↪ цитирует @x: Why all women are wearing this?»
+    # проходит (quote даёт +8 слов), хотя авторский вклад = 4 слова.
+    author_part = text
+    for marker in ("↪ цитирует ", "Цитирует @", "\n▌ @", "▌ @"):
+        idx = author_part.find(marker)
+        if idx > 0:
+            author_part = author_part[:idx]
+            break
+    cleaned = re.sub(r"https?://\S+|@\w+", "", author_part).strip()
     words = cleaned.split()
     if len(words) < 5:
         return True, "too_short"
