@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Sequence
 
-from sqlalchemy import select, and_, not_
+from sqlalchemy import and_, func, not_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import settings
@@ -202,7 +202,36 @@ async def get_candidate_pool(
         .limit(limit)
     )
     res = await session.execute(stmt)
-    return list(res.scalars().all())
+    results = list(res.scalars().all())
+    if results:
+        return results
+
+    # Fallback для power-юзеров: расширяем окно 2x И разрешаем повторно
+    # показать твиты, которые юзер лайкнул (liked=True — явный сигнал
+    # "хочу ещё"). Лучше дать подборку из уже виденного, чем пустое
+    # сообщение "нет свежих постов".
+    extended_cutoff = datetime.now(timezone.utc) - timedelta(hours=age_h * 2)
+    liked_sent_stmt = select(Feedback.tweet_id).where(
+        Feedback.user_id == user.telegram_id,
+        Feedback.liked.is_(True),
+    )
+    stmt_extended = (
+        select(Tweet)
+        .where(
+            and_(
+                Tweet.created_at >= extended_cutoff.replace(tzinfo=None),
+                Tweet.embedding.is_not(None),
+                or_(
+                    not_(Tweet.tweet_id.in_(sent_ids_stmt)),
+                    Tweet.tweet_id.in_(liked_sent_stmt),
+                ),
+            )
+        )
+        .order_by(Tweet.fetched_at.desc())
+        .limit(limit)
+    )
+    res2 = await session.execute(stmt_extended)
+    return list(res2.scalars().all())
 
 
 # ----------------------- main pick ------------------------
@@ -232,6 +261,26 @@ async def pick_top_for_user(
 
     user_vec = user.preference_vector
     cluster_weights = user.cluster_weights or {}
+
+    # Bootstrap: если preference_vector ещё не накопился (новый юзер / нет
+    # реакций), cosine(tweet, None) = 0 для всех — ранжирование схлопнется
+    # в trust+freshness и выглядит как случайное. Синтезируем временный
+    # вектор из якорей кластеров, взвешенных по cluster_weights (которые
+    # задаются в онбординге). Даёт осмысленные relevance-скоры с дня 1.
+    if not user_vec and cluster_weights:
+        anchors = await emb.get_cluster_anchors()
+        if anchors:
+            total_w = sum(cluster_weights.values())
+            if total_w > 0:
+                dim = len(next(iter(anchors.values())))
+                boot_vec = [0.0] * dim
+                for name, w in cluster_weights.items():
+                    anchor = anchors.get(name)
+                    if anchor:
+                        for i, v in enumerate(anchor):
+                            boot_vec[i] += (w / total_w) * v
+                if any(boot_vec):
+                    user_vec = emb.normalize(boot_vec)
 
     # Предзагружаем карту FollowedAuthor.weight для текущего юзера — одним
     # запросом, чтобы не тянуть на каждый твит. Это ключ Bug 9: новые каналы
@@ -273,10 +322,13 @@ async def pick_top_for_user(
         if len(picked) >= exploit_n:
             break
         div_pen = diversity_penalty(cand.tweet.embedding, picked_embs)
-        # Пересчитываем score с актуальным penalty.
-        adjusted = cand.score - 0.15 * div_pen
-        # Порог "не добавляем совсем дубликат".
-        if div_pen > 1.0:
+        # Мягкий cap вместо жёсткого пропуска: для узких горячих тем
+        # (e.g. "Claude 4.7 release") все посты cosine > 0.95 → div_pen
+        # уходит в космос после первого же выбора, и юзер видит 1 пост
+        # по горячей теме вместо 3-4. Штрафуем, но не блокируем.
+        capped_pen = min(div_pen, 0.8)
+        adjusted = cand.score - 0.15 * capped_pen
+        if adjusted < -0.3:
             continue
         cand.score = adjusted
         picked.append(cand)
@@ -340,6 +392,18 @@ async def apply_implicit_skip_decay(
     if not user.preference_vector:
         return 0
 
+    # Минимальный порог реального фидбэка — decay должен корректировать
+    # уже устоявшийся вектор, а не формировать его. Без этого 1 пропущенный
+    # батч у нового юзера полностью ломал preference_vector.
+    real_feedback_count = (await session.execute(
+        select(func.count(Feedback.id)).where(
+            Feedback.user_id == user.telegram_id,
+            Feedback.liked.is_not(None),
+        )
+    )).scalar() or 0
+    if real_feedback_count < 3:
+        return 0
+
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours_without_reaction)
 
     # SentNews для этого юзера, где: (a) прошло > cutoff и (b) нет Feedback.
@@ -369,7 +433,10 @@ async def apply_implicit_skip_decay(
     for _sent, tweet in rows:
         if not tweet.embedding:
             continue
-        vec = emb.update_on_dislike(vec, tweet.embedding, settings.implicit_skip_penalty)
+        # Пониженный rate (0.005 vs settings.implicit_skip_penalty=0.015):
+        # 6-часовая джоба обрабатывала сразу 20+ постов у спящего юзера и
+        # схлопывала preference_vector. Оставляем мягкий сигнал, а не бульдозер.
+        vec = emb.update_on_dislike(vec, tweet.embedding, 0.005)
         # Записываем Feedback(liked=None) чтобы больше не учитывать эти твиты.
         session.add(
             Feedback(

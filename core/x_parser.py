@@ -1348,59 +1348,102 @@ def _convert_tweet(t, fallback_author: str) -> RawTweet:
     media_list = getattr(t, "media", None) or []
 
     def _best_mp4(media_obj) -> Optional[str]:
-        """Из media с видео достаём mp4 с наибольшим bitrate.
+        """Из media с видео достаём наилучший отправляемый mp4.
 
-        В twikit 2.x Stream.content_type читает `_data['content-type']` (с дефисом),
-        но Twitter в JSON-данных variants использует ключ `content_type` (с подчёркиванием)
-        — property возвращает None. Поэтому читаем сырой variants напрямую из video_info.
+        Telegram bot API принимает до ~45MB на upload видео (см. delivery.py,
+        max_bytes в `_download_bytes`). Раньше функция тупо возвращала
+        максимальный bitrate — X amplify_video отдаёт варианты до 4K/50Mbps,
+        18-мин туториал превращается в 500MB и Telegram отваливается с
+        «wrong type of the web page content».
+
+        Алгоритм:
+          1. Собираем все mp4-кандидаты (url, bitrate).
+          2. Если известен duration — выбираем максимальный bitrate при котором
+             est_bytes = bitrate * duration / 8 ≤ 40MB (с запасом под 45MB лимит).
+          3. Если duration не известен — cap на ~3 Mbps (≈720p/1080p коротких).
+          4. Если ничего не влезает — берём минимальный bitrate (хоть какое-то
+             видео, delivery откатится на текст если всё равно большое).
         """
         try:
             vi = getattr(media_obj, "video_info", None) or {}
             variants = vi.get("variants") if isinstance(vi, dict) else None
-            best_url, best_br = None, -1
+            duration_sec: Optional[float] = None
+            if isinstance(vi, dict):
+                try:
+                    dm = vi.get("duration_millis") or vi.get("durationMillis") or 0
+                    duration_sec = float(dm) / 1000.0 if dm else None
+                except (TypeError, ValueError):
+                    duration_sec = None
+
+            # (url, bitrate) пары. bitrate=0 допустим (иногда так отдают AUDIO-less).
+            candidates: list[tuple[str, int]] = []
+
+            def _push_mp4(url_v: Optional[str], ct: str, br_raw) -> None:
+                # HLS явно пропускаем — Telegram не играет m3u8.
+                # В twikit 2.x Stream.content_type читает _data['content-type'] (с дефисом),
+                # но X в variants использует content_type (с подчёркиванием) — property
+                # возвращает None. Поэтому читаем сырой ключ всегда.
+                if not url_v:
+                    return
+                ct_l = (ct or "").lower()
+                if "mpegurl" in ct_l or url_v.endswith(".m3u8"):
+                    return
+                is_mp4 = ("mp4" in ct_l) or (".mp4" in url_v.lower())
+                if not is_mp4:
+                    return
+                try:
+                    br = int(br_raw or 0)
+                except (TypeError, ValueError):
+                    br = 0
+                candidates.append((url_v, br))
+
             if variants:
                 for v in variants:
-                    ct = str(v.get("content_type") or v.get("content-type") or "").lower()
-                    url_v = v.get("url")
-                    try:
-                        br = int(v.get("bitrate") or 0)
-                    except (TypeError, ValueError):
-                        br = 0
-                    # Принимаем любые mp4 (в URL или в content_type). HLS (application/x-mpegURL)
-                    # явно пропускаем — Telegram не умеет играть m3u8.
-                    if not url_v:
-                        continue
-                    if "mpegurl" in ct or url_v.endswith(".m3u8"):
-                        continue
-                    is_mp4 = ("mp4" in ct) or (".mp4" in url_v.lower())
-                    if is_mp4 and br > best_br:
-                        best_br = br
-                        best_url = url_v
-            # Фолбэк: обычный .streams (для старых версий twikit и photo-like объектов).
-            if not best_url:
+                    _push_mp4(
+                        v.get("url"),
+                        str(v.get("content_type") or v.get("content-type") or ""),
+                        v.get("bitrate"),
+                    )
+
+            if not candidates:
                 streams = getattr(media_obj, "streams", None) or []
                 for st in streams:
                     raw = getattr(st, "_data", None) or {}
-                    ct = str(
-                        raw.get("content_type")
-                        or raw.get("content-type")
-                        or getattr(st, "content_type", "")
-                        or ""
-                    ).lower()
-                    url_v = getattr(st, "url", None) or raw.get("url")
-                    try:
-                        br = int(getattr(st, "bitrate", 0) or raw.get("bitrate") or 0)
-                    except (TypeError, ValueError):
-                        br = 0
-                    if not url_v:
-                        continue
-                    if "mpegurl" in ct or url_v.endswith(".m3u8"):
-                        continue
-                    is_mp4 = ("mp4" in ct) or (".mp4" in url_v.lower())
-                    if is_mp4 and br > best_br:
-                        best_br = br
-                        best_url = url_v
-            return best_url
+                    _push_mp4(
+                        getattr(st, "url", None) or raw.get("url"),
+                        str(
+                            raw.get("content_type")
+                            or raw.get("content-type")
+                            or getattr(st, "content_type", "")
+                            or ""
+                        ),
+                        getattr(st, "bitrate", 0) or raw.get("bitrate") or 0,
+                    )
+
+            if not candidates:
+                return None
+
+            tg_budget_bytes = 40 * 1024 * 1024
+            bitrate_cap_fallback = 3_000_000
+
+            if duration_sec and duration_sec > 0:
+                fitting = [
+                    (u, b) for (u, b) in candidates
+                    if b > 0 and (b * duration_sec / 8) <= tg_budget_bytes
+                ]
+                if fitting:
+                    return max(fitting, key=lambda x: x[1])[0]
+            else:
+                capped = [(u, b) for (u, b) in candidates if 0 < b <= bitrate_cap_fallback]
+                if capped:
+                    return max(capped, key=lambda x: x[1])[0]
+
+            # Ничего не влезает — минимальный bitrate, пусть Telegram/delivery
+            # решает (он откатится на текст если и это слишком большое).
+            ranked = [(u, b) for (u, b) in candidates if b > 0]
+            if ranked:
+                return min(ranked, key=lambda x: x[1])[0]
+            return candidates[0][0]
         except Exception as e:
             log.debug("_best_mp4 failed: %s", e)
             return None

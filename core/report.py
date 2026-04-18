@@ -31,7 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from config import settings
 from core import ai_client
 from core import embeddings as emb
-from core.filters import hype_score, is_low_signal
+from core.filters import hype_score, is_low_signal, is_noise_by_embedding
 from core.recommender import freshness_score
 from core.x_parser import RawTweet, parser
 from db.models import Feedback, SentNews, Tweet, User
@@ -462,21 +462,35 @@ async def build_report(
     # по ним идёт активная дискуссия сейчас. Отрезать по времени = потерять
     # самые «обсуждаемые» карточки (и есть риск получить 0 тем, как у юзера).
     if source == "following":
+        # Разбавляем Following-хронику постами из For You — алгоритмических X
+        # trending'ов. Без этого «моя лента» показывает 3-4 узкие темы из
+        # подписок пользователя, а «что обсуждают» — 8-10 тем. Юзер хочет
+        # такую же ширину. Подмешиваем до 40 постов, with dedup по tweet_id.
+        fy_injected = 0
+        try:
+            fy_extra = await parser.get_for_you_timeline(limit=40)
+            already_ids = {t.tweet_id for t in raw}
+            for t in fy_extra:
+                if t.tweet_id not in already_ids:
+                    raw.append(t)
+                    already_ids.add(t.tweet_id)
+                    fy_injected += 1
+        except Exception as e:
+            log.debug("for_you injection into following failed: %s", e)
+        if fy_injected:
+            log.info("following: +%d posts from For You for topic breadth", fy_injected)
+
         cutoff = datetime.now(timezone.utc) - timedelta(hours=window_hours * 2)
         raw = [
             t for t in raw
             if (t.created_at if t.created_at.tzinfo else t.created_at.replace(tzinfo=timezone.utc)) >= cutoff
         ]
-        # Per-author dedup: в Following-фетче подписочные аккаунты-новостники
-        # (Reuters/TheEconomist/AP) генерят десятки постов в окне — без cap
-        # они занимают 75%+ ленты и юзеру кажется что моя-лента =
-        # «Reuters спам». Замер: Reuters 47/80 постов. С cap=3 — лента
-        # становится разнообразной, остальные подписки просвечивают.
-        # Cap был 5 — из 400 постов 33 уникальных автора давали только 93 поста
-        # в кластеризацию, многие темы разваливались. 8 — Reuters/TheEconomist
-        # естественно образуют «News» кластер из 8 постов (легитно если юзер
-        # подписан), остальные подписки тоже больше просвечивают.
-        MAX_PER_AUTHOR = 8
+        # Per-author cap: Reuters/TheEconomist/AP генерят десятки постов в
+        # окне, и без cap они доминируют. Раньше был 8 — but юзер снова
+        # жалуется «темы одинаковые, собирается всё в одну ноту». 4 — жёстче,
+        # news-кластер теперь 4 поста (всё ещё видим), а подписки обычных
+        # людей имеют шанс проявиться.
+        MAX_PER_AUTHOR = 4
         seen_per_author: dict[str, int] = {}
         capped: list[RawTweet] = []
         # Сортируем по engagement сначала — топовые посты автора важнее
@@ -561,6 +575,28 @@ async def build_report(
     texts = [t.text for t in filtered]
     embs = await emb.embed_batch(texts)
     pairs = [(rt, e) for rt, e in zip(filtered, embs) if e]
+
+    # ---------- 4b. Embedding-anchor noise filter ----------
+    # is_low_signal (regex) не ловит рекламу без слов sponsored/promo:
+    # «70% OFF tuxedo», «Dakota Mini Dress $80.50», «Big & Tall London new
+    # arrival». Сравниваем embedding каждого поста с anchor-описаниями
+    # ad/drive-by-reply/content-farm. Порог в filters.py консервативный
+    # — режем только уверенные случаи.
+    if pairs:
+        cleaned_pairs: list[tuple[RawTweet, list[float]]] = []
+        noise_n = 0
+        for rt, e in pairs:
+            is_noise, reason = await is_noise_by_embedding(e)
+            if is_noise:
+                noise_n += 1
+                log.debug("anchor-noise dropped %s: %s", rt.tweet_id, reason)
+                continue
+            cleaned_pairs.append((rt, e))
+        if noise_n:
+            trash_n += noise_n
+            log.info("anchor-noise filter: %d/%d dropped", noise_n, len(pairs))
+            await _notify(f"🧹 Отсеял {noise_n} рекламы/болтовни…")
+        pairs = cleaned_pairs
 
     # ---------- 5. Upsert to DB ----------
     tweet_map = await _upsert_raw_tweets(session, pairs)

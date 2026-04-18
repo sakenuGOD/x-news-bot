@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from typing import Iterable, Sequence
@@ -74,6 +75,17 @@ def is_trash(tweet: RawTweet) -> tuple[bool, str]:
     words = cleaned.split()
     if len(words) < 5:
         return True, "too_short"
+
+    # Reply-fragment: ≥2 @-mentions в начале и короткий остаток. Это
+    # классический фрагмент реплая («@a @b @c Love the style of the gauges»),
+    # который сам по себе бессмыслен — его читать без тред-контекста нельзя.
+    # Одиночный @mention оставляем (может быть legit discussion).
+    leading = re.match(r"^(\s*@\w+\s*){2,}", text)
+    if leading:
+        rest = text[leading.end():].strip()
+        rest_clean = re.sub(r"https?://\S+", "", rest)
+        if len(rest_clean.split()) < 12:
+            return True, "reply_fragment"
 
     # Слишком много хештегов.
     if len(tweet.hashtags) > 5:
@@ -344,6 +356,197 @@ def is_low_signal(
     if density < min_density:
         return True, f"low_density:{density:.2f}"
     return False, ""
+
+
+# ----------------------- embedding-anchor noise detection -----------------------
+#
+# Регулярки из `is_low_signal` пропускают рекламу, у которой нет слова
+# «sponsored/promo» — типа «70% OFF tuxedo» @MenswearDeals, «Dakota Mini Dress
+# $80.50» @qwikad_com, «Big & Tall London is pleased to introduce a refined
+# collection of premium jeans» @BigandLondon. Их info_density проходит (есть
+# цифра/бренд/%), hype_score низкий, цельный текст — формально «контент».
+# Но это всё равно шоппинг-реклама.
+#
+# Решение без хардкода username'ов: эмбеддим 1 раз набор описаний «типов шума»
+# (реклама, однострочный chatty-reply, content-farm), и на этапе векторизации
+# постов смотрим cosine к anchor'ам. Порог подобран так, чтобы не резать
+# легитные обсуждения моды/крипты/IT (cosine к anchor обычно 0.15-0.30),
+# а бить именно по текстам которые семантически близки к рекламе или
+# болтовне-реплаю. Anchors описывают ПРИРОДУ шума, не домен, поэтому
+# работают одинаково для любого кластера (мода, AI, крипта).
+
+_NOISE_ANCHOR_DESCRIPTIONS: dict[str, str] = {
+    "promo_ad": (
+        "retail product listing with price tag and shop link, "
+        "percent off discount deal shop now call to action, "
+        "e-commerce storefront post advertising merchandise with purchase URL, "
+        "brand new arrival announcement linking to online catalog, "
+        "sale pitch buy today limited offer promotional push"
+    ),
+    "drive_by_reply": (
+        "short conversational reply to another tweet with mentions, "
+        "offhand chat remark, casual one-liner replying to a mentioned account, "
+        "low-effort quip, small-talk response, passing compliment or joke reply, "
+        "fragment of a reply chain without standalone meaning"
+    ),
+    "content_farm": (
+        "generic low-effort social media filler stuffed with sparkle and fire emojis, "
+        "dazzling emoji-heavy brand announcement with many decorative symbols, "
+        "bot-generated hype chatter without specific claim, "
+        "engagement-bait question without context, "
+        "cliche lifestyle magazine headline roundup with numbered trends, "
+        "lifestyle promotional post full of emoji decoration and hashtag spam"
+    ),
+}
+
+# «Хорошие» anchor'ы — то, что явно НЕ шум. Используем argmax-подход:
+# если лучший noise-anchor ближе чем лучший signal-anchor (с запасом MARGIN),
+# пост признаём шумом. Это устойчивее к абсолютным порогам: Viktor Oddy
+# «recorded 18-min tutorial» — это announcement, ловится positive anchor
+# сильнее, чем promo_ad; @BigandLondon «pleased to introduce new arrival»
+# сильнее тянется к promo_ad, чем к announcement.
+_SIGNAL_ANCHOR_DESCRIPTIONS: dict[str, str] = {
+    "opinion_commentary": (
+        "personal opinion or commentary on a topic, subjective observation, "
+        "critique or analysis, thoughtful reflection, debate or argument about "
+        "a trend or event, first-person perspective on cultural or technical shift"
+    ),
+    "announcement_creation": (
+        "first-person announcement of something the author just built made or "
+        "recorded, launching a project video or blog, sharing a how-to tutorial "
+        "the speaker authored, release note from a creator about their own work"
+    ),
+    "news_report": (
+        "news reporting of a concrete event, factual update about a specific "
+        "incident or development, breaking story with named entities and timeline, "
+        "journalistic account of what happened"
+    ),
+    "technical_claim": (
+        "technical claim or benchmark about a product or system, "
+        "side-by-side comparison with measurements, specific capability statement "
+        "about software model or hardware, engineering detail or methodology"
+    ),
+}
+
+# Пост признаётся шумом если best_noise_sim - best_signal_sim >= MARGIN.
+# 0.07 — калибровано на выборке реальных постов: MenswearDeals/BigandLondon/
+# qwikad/Lulu/fngdesign проходят (d≥0.083, d-values из _test_anchors.py
+# на момент настройки), tutorial-посты «Opus 4.7 + SeedDance» от
+# @viktoroddy сохраняются (d≈0.06 <margin). Снижать не стоит — начнёт
+# резать announcement'ы с маркетинговым оттенком.
+_NOISE_MARGIN = 0.07
+# Абсолютный минимум noise-anchor, ниже — даже при большой разнице не режем
+# (защита от случаев где все anchor'ы далёкие).
+_NOISE_ABS_MIN = 0.22
+
+_noise_anchors: dict[str, list[float]] | None = None
+_signal_anchors: dict[str, list[float]] | None = None
+_anchor_lock = asyncio.Lock()
+
+
+async def _ensure_anchors() -> None:
+    global _noise_anchors, _signal_anchors
+    if _noise_anchors is not None and _signal_anchors is not None:
+        return
+    async with _anchor_lock:
+        if _noise_anchors is not None and _signal_anchors is not None:
+            return
+        from core import embeddings as _emb  # локальный импорт во избежание circular
+        all_names = list(_NOISE_ANCHOR_DESCRIPTIONS.keys()) + list(_SIGNAL_ANCHOR_DESCRIPTIONS.keys())
+        all_descs = (
+            list(_NOISE_ANCHOR_DESCRIPTIONS.values())
+            + list(_SIGNAL_ANCHOR_DESCRIPTIONS.values())
+        )
+        embs = await _emb.embed_batch(all_descs)
+        noise: dict[str, list[float]] = {}
+        signal: dict[str, list[float]] = {}
+        for name, e in zip(all_names, embs):
+            if not e:
+                continue
+            if name in _NOISE_ANCHOR_DESCRIPTIONS:
+                noise[name] = e
+            else:
+                signal[name] = e
+        _noise_anchors = noise
+        _signal_anchors = signal
+        log.info("anchors computed: %d noise, %d signal", len(noise), len(signal))
+
+
+async def get_noise_anchors() -> dict[str, list[float]]:
+    """Публичный accessor (используется в тестах/диагностике)."""
+    await _ensure_anchors()
+    return dict(_noise_anchors or {})
+
+
+async def get_signal_anchors() -> dict[str, list[float]]:
+    await _ensure_anchors()
+    return dict(_signal_anchors or {})
+
+
+async def is_noise_by_embedding(
+    tweet_emb: Sequence[float],
+) -> tuple[bool, str]:
+    """Argmax-классификатор: сравниваем с ближайшим signal- и noise-anchor'ом.
+
+    Возвращает (is_noise, "noise:<type>:<noise_sim>-<signal_sim>") для логов.
+    Вызывать ПОСЛЕ embed_batch (raw не имеет embedding).
+    """
+    if not tweet_emb:
+        return False, ""
+    await _ensure_anchors()
+    if not _noise_anchors or not _signal_anchors:
+        return False, ""
+
+    best_noise_name = ""
+    best_noise_sim = -1.0
+    for name, anchor in _noise_anchors.items():
+        sim = cosine_similarity(tweet_emb, anchor)
+        if sim > best_noise_sim:
+            best_noise_sim = sim
+            best_noise_name = name
+
+    best_signal_sim = -1.0
+    for anchor in _signal_anchors.values():
+        sim = cosine_similarity(tweet_emb, anchor)
+        if sim > best_signal_sim:
+            best_signal_sim = sim
+
+    if best_noise_sim < _NOISE_ABS_MIN:
+        return False, ""
+    if best_noise_sim - best_signal_sim >= _NOISE_MARGIN:
+        return True, f"noise:{best_noise_name}:{best_noise_sim:.2f}-{best_signal_sim:.2f}"
+    return False, ""
+
+
+def _engagement_vs_reach(tweet: RawTweet, author_followers: int) -> float:
+    """Лайки-плюс-реплаи нормализованные на followers.
+
+    Промо-аккаунты с >5k followers редко получают даже 1 лайк на пост —
+    engagement ниже 0.00005 (1 на 20k подписчиков) достаточно уверенно
+    маркирует «никто это не читает, потому что это реклама/мусор».
+    Для мелких аккаунтов (≤1k followers) метрика бесполезна — возвращаем
+    нейтральное значение.
+    """
+    if author_followers < 1000:
+        return 1.0
+    total = tweet.likes_count + 2 * tweet.retweets_count + tweet.replies_count
+    return total / max(1, author_followers)
+
+
+def is_dead_promo(tweet: RawTweet, author_followers: int) -> bool:
+    """Большой аккаунт + мёртвый пост + возраст ≥2ч → почти всегда реклама.
+
+    Не белые/чёрные списки — метрика. 5k+ подписчиков и меньше 3 total
+    реакций за 2+ часа = пост не читают даже сами подписчики автора.
+    Мелкие авторы (<1k) освобождены, чтобы не резать мирных пользователей
+    которых юзер лайкал лично.
+    """
+    if author_followers < 5000:
+        return False
+    if tweet.age_hours < 2.0:
+        return False
+    total = tweet.likes_count + tweet.retweets_count + tweet.replies_count
+    return total < 3
 
 
 def needs_antifake_check(tweet: RawTweet, author_trust: float) -> bool:

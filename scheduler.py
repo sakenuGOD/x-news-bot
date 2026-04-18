@@ -28,12 +28,13 @@ from core import ai_client
 from core.filters import (
     dedupe_by_embedding,
     engagement_rate,
+    is_noise_by_embedding,
     is_trash,
     needs_antifake_check,
 )
 from core.x_parser import RawTweet, compute_trust_score, parser
 from db.database import session_scope
-from db.models import FollowedAuthor, Tweet, User
+from db.models import Feedback, FollowedAuthor, Tweet, User
 from db.vector_store import upsert_tweets
 
 log = logging.getLogger(__name__)
@@ -109,6 +110,24 @@ async def _process_and_save(raw_tweets: list[RawTweet]) -> int:
 
     # 4) Пара (tweet, emb) только если эмбеддинг получился.
     pairs = [(t, e) for t, e in zip(new_tweets, embs) if e]
+    if not pairs:
+        return 0
+
+    # 4b) Anchor-noise filter (рекламные посты без явных маркеров).
+    # Отсекаем ДО сохранения в БД — иначе они попадают в candidate pool
+    # рекомендера и светятся в «моей ленте».
+    noise_dropped = 0
+    kept_pairs: list[tuple[RawTweet, list[float]]] = []
+    for t, e in pairs:
+        is_noise, reason = await is_noise_by_embedding(e)
+        if is_noise:
+            noise_dropped += 1
+            log.debug("anchor-noise pre-save drop %s: %s", t.tweet_id, reason)
+            continue
+        kept_pairs.append((t, e))
+    if noise_dropped:
+        log.info("anchor-noise pre-save: %d/%d dropped", noise_dropped, len(pairs))
+    pairs = kept_pairs
     if not pairs:
         return 0
 
@@ -257,8 +276,16 @@ async def delivery_job(bot: Bot) -> None:
 
 
 async def implicit_decay_job() -> None:
-    """Обрабатываем implicit skips — пользователю присылали, но он не реагировал."""
+    """Обрабатываем implicit skips — пользователю присылали, но он не реагировал.
+
+    Важно: прогоняем ТОЛЬКО активных за 48h юзеров с хотя бы одним реальным
+    лайком/дизлайком. Иначе джоба штрафовала спящих юзеров за 20 постов
+    присланных в 3 ночи и полностью ломала preference_vector.
+    """
     from core.recommender import apply_implicit_skip_decay
+
+    now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+    active_cutoff = now_naive - timedelta(hours=48)
 
     async with session_scope() as s:
         users = list(
@@ -267,15 +294,71 @@ async def implicit_decay_job() -> None:
                     select(User).where(
                         User.onboarding_done.is_(True),
                         User.preference_vector.is_not(None),
+                        User.last_delivered_at.is_not(None),
+                        User.last_delivered_at >= active_cutoff,
                     )
                 )
             ).scalars().all()
         )
         for u in users:
+            has_real_fb = (await s.execute(
+                select(Feedback.id)
+                .where(
+                    Feedback.user_id == u.telegram_id,
+                    Feedback.liked.is_not(None),
+                )
+                .limit(1)
+            )).scalar_one_or_none()
+            if not has_real_fb:
+                continue
             try:
-                await apply_implicit_skip_decay(s, u, hours_without_reaction=12)
+                await apply_implicit_skip_decay(s, u, hours_without_reaction=24)
             except Exception as e:
                 log.warning("implicit decay for %s failed: %s", u.telegram_id, e)
+
+
+# ------------------------- 4. refresh_cluster_weights_job ----------------------------
+
+
+async def refresh_cluster_weights_job() -> None:
+    """Переpересчитывает cluster_weights из недавних позитивных реакций.
+
+    cluster_weights ставятся на онбординге и точечно корректируются через
+    "хочу больше X". Без явных запросов они протухают — юзер лайкает AI-посты
+    месяц, а cluster_weights всё ещё отражают его стартовый список Following.
+    Раз в неделю смешиваем 70% свежего сигнала (topics лайкнутых за 14 дней)
+    с 30% старых весов.
+    """
+    from collections import Counter
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=14)
+    async with session_scope() as s:
+        users = (await s.execute(
+            select(User).where(User.onboarding_done.is_(True))
+        )).scalars().all()
+        for user in users:
+            liked_rows = (await s.execute(
+                select(Tweet.topic)
+                .join(Feedback, Feedback.tweet_id == Tweet.tweet_id)
+                .where(
+                    Feedback.user_id == user.telegram_id,
+                    Feedback.liked.is_(True),
+                    Feedback.created_at >= cutoff.replace(tzinfo=None),
+                )
+            )).all()
+            if not liked_rows:
+                continue
+            topic_counts = Counter(r[0] for r in liked_rows if r[0])
+            if not topic_counts:
+                continue
+            total = sum(topic_counts.values())
+            new_weights = {t: count / total for t, count in topic_counts.items()}
+            old_weights = user.cluster_weights or {}
+            merged: dict[str, float] = {}
+            all_keys = set(new_weights) | set(old_weights)
+            for k in all_keys:
+                merged[k] = 0.7 * new_weights.get(k, 0.0) + 0.3 * old_weights.get(k, 0.0)
+            user.cluster_weights = merged
 
 
 # ------------------------- scheduler setup ----------------------------
@@ -306,6 +389,14 @@ def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
         "interval",
         hours=6,
         id="implicit_decay",
+        coalesce=True,
+        max_instances=1,
+    )
+    scheduler.add_job(
+        refresh_cluster_weights_job,
+        "interval",
+        hours=168,
+        id="cluster_refresh",
         coalesce=True,
         max_instances=1,
     )
