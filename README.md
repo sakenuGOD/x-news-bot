@@ -6,11 +6,35 @@ Built around one principle: **respect the user's real X feed**. The bot doesn't 
 
 ---
 
+## example output
+
+```
+📊 Дайджест · 09:14
+за последние 20 ч из твоей ленты
+
+🤖 Claude Opus 4.7 · 25 постов
+Anthropic выкатили Opus 4.7 — 87.6% на SWE-bench.
+Cursor и Cline обновили дефолты. В постах спор:
+одни хвалят скорость, другие жалуются на лимиты.
+
+💰 Tether Q3 · 18 постов
+Прибыль Q3 — $3.2B, резервы $127B. Снова всплыл
+вопрос прозрачности резервов USDT.
+
+🎮 Steam Deck 2 · 12 постов
+Утекли спеки: OLED + Zen5 APU на 2026.
+Valve официально молчит.
+```
+
+Clusters are ordered by size — what's actually dominant in your feed wins, not what matches a keyword.
+
+---
+
 ## what it does
 
-- **📊 что обсуждают** — snapshot of your For You timeline over the last 20h, clustered into topics. Top 7 clusters are pre-summarised (Grok-Stories style) in parallel before the digest is rendered.
-- **📰 моя лента** — same, but from your Following (chronological) timeline over 24h. Per-author cap of 8 keeps Reuters/Economist from eating 75% of the digest without silencing them entirely.
-- **💬 хочу больше X** — free-form text → Claude picks real X handles for the topic, validates them via `get_author_info` (exists + ≥500 followers or verified), adds them to your tracked list, and immediately fetches their recent posts with a cosine-similarity gate (≥ 0.25 to the query anchor) so junk from topic-matching-but-unrelated accounts is dropped.
+- 📊 **что обсуждают** (what's being discussed) — snapshot of your For You timeline over the last 20h, clustered into topics. Top 7 clusters are pre-summarised (Grok-Stories style) in parallel before the digest is rendered.
+- 📰 **моя лента** (my feed) — same, but from your Following (chronological) timeline over 24h. Per-author cap of 8 keeps Reuters/Economist from eating 75% of the digest without silencing them entirely.
+- 💬 **хочу больше X** (show me more X) — free-form text → Claude picks real X handles for the topic, validates them via `get_author_info` (exists + ≥500 followers or verified), adds them to your tracked list, and immediately fetches their recent posts with a cosine-similarity gate (≥ 0.25 to the query anchor) so junk from topic-matching-but-unrelated accounts is dropped.
 - **👍 / 👎** — updates a persistent preference vector and dampens disliked topics for the next 6 hours (≥ 5 dislikes excludes the named cluster).
 - **dual-media** — when a post quotes another post that carries media, the bot sends two Telegram messages (author + quote) and tracks both message IDs so `← Назад` cleans up both.
 - **/reset**, **⏸ pause**, custom delivery interval.
@@ -94,7 +118,7 @@ Universal, author-agnostic:
 
 No hardcoded author blocklists, no topic-specific regexes. Engagement floors (e.g. "0 likes after 2h = trash") were explicitly removed — they silenced legitimate posts from small AI/IT accounts that get 0 likes in the first few hours but carry real signal.
 
-If you want to block a specific handle, the bot adds it to `user.blocked_authors` when you type "исключи @handle".
+If you want to block a specific handle, the bot adds it to `user.blocked_authors` when you type "исключи @handle" (exclude @handle).
 
 ---
 
@@ -205,8 +229,8 @@ x-news-bot/
 ## troubleshooting
 
 - **429 flooding the logs** — X cookies expired, refresh `X_AUTH_TOKEN`. Cooldowns prevent a death-loop but won't recover without live auth.
-- **«⏳ смотрю что обсуждают» hangs** — rate-limited on For You. Wait 15min or use «моя лента» (Following is less restricted).
-- **"разное · 3 поста"** — timeline is quiet right now, or filters are too tight for this hour. Try again in an hour, or widen `window_hours` in `bot/handlers/report.py`.
+- **«⏳ смотрю что обсуждают» (looking at what's being discussed) hangs** — rate-limited on For You. Wait 15min or use «моя лента» (Following is less restricted).
+- **"разное · 3 поста"** (misc · 3 posts) — timeline is quiet right now, or filters are too tight for this hour. Try again in an hour, or widen `window_hours` in `bot/handlers/report.py`.
 - **SQLite migration errors** — columns are added via `ALTER TABLE` in `db/database.py:init_db`. "column already exists" is idempotent-ignored.
 
 ---
