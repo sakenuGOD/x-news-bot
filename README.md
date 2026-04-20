@@ -8,29 +8,44 @@ Built around one principle: **respect the user's real X feed**. The bot doesn't 
 
 ## example output
 
-```
-📊 Дайджест · 09:14                              (Digest · 09:14)
-за последние 20 ч из твоей ленты                 (last 20h from your feed)
+Real digest (output is in Russian — the bot's target audience):
 
-🤖 Claude Opus 4.7 · 25 постов                   (25 posts)
+```
+📊 Дайджест · 09:14
+за последние 20 ч из твоей ленты
+
+🤖 Claude Opus 4.7 · 25 постов
 Anthropic выкатили Opus 4.7 — 87.6% на SWE-bench.
 Cursor и Cline обновили дефолты. В постах спор:
 одни хвалят скорость, другие жалуются на лимиты.
-(Anthropic shipped Opus 4.7 — 87.6% on SWE-bench.
- Cursor and Cline updated defaults. Posts dispute:
- some praise speed, others complain about limits.)
 
-💰 Tether Q3 · 18 постов                         (18 posts)
+💰 Tether Q3 · 18 постов
 Прибыль Q3 — $3.2B, резервы $127B. Снова всплыл
 вопрос прозрачности резервов USDT.
-(Q3 profit — $3.2B, reserves $127B. USDT reserve
- transparency debate reignited.)
 
-🎮 Steam Deck 2 · 12 постов                      (12 posts)
+🎮 Steam Deck 2 · 12 постов
 Утекли спеки: OLED + Zen5 APU на 2026.
 Valve официально молчит.
-(Specs leaked: OLED + Zen5 APU for 2026.
- Valve officially silent.)
+```
+
+English translation:
+
+```
+📊 Digest · 09:14
+last 20h from your feed
+
+🤖 Claude Opus 4.7 · 25 posts
+Anthropic shipped Opus 4.7 — 87.6% on SWE-bench.
+Cursor and Cline updated defaults. Posts dispute:
+some praise speed, others complain about limits.
+
+💰 Tether Q3 · 18 posts
+Q3 profit — $3.2B, reserves $127B. USDT reserve
+transparency debate reignited.
+
+🎮 Steam Deck 2 · 12 posts
+Specs leaked: OLED + Zen5 APU for 2026.
+Valve officially silent.
 ```
 
 Clusters are ordered by size — what's actually dominant in your feed wins, not what matches a keyword.
